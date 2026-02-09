@@ -1,0 +1,40 @@
+__pycache__/
+*.py[cod]
+*.so
+
+# Virtual environments
+.env
+.venv
+venv/
+ENV/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Data / artifacts
+data/
+datasets/
+outputs/
+checkpoints/
+runs/
+wandb/
+mlruns/
+
+# Logs
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDEs / editors
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Packaging
+build/
+dist/
+*.egg-info/
+
