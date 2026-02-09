@@ -12,7 +12,7 @@ ENV/
 .ipynb_checkpoints/
 
 # Data / artifacts
-data/
+
 datasets/
 outputs/
 checkpoints/
