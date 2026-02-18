@@ -62,6 +62,21 @@ class SARDataset(Dataset):
     - mode="strong": read masks from mask_root (hand label directory).
     - mode="none": no masks returned.
 
+    ids_or_paths behavior:
+    - IDs (e.g., "tile_000123"): resolved under img_root and mask_root.
+    - Paths (absolute or containing separators, or .tif/.tiff suffix): used directly for images;
+      masks are still resolved under mask_root using the image stem.
+
+    Time-matched behavior (use_time_matched=True):
+    - Reads an 8-band stack (VV, VH + 6x S2 bands) from time_matched_root/{split}/{id}.tif
+      or uses the time_matched_manifest if present.
+    - Metadata always includes time_matched_status and time_matched_path (even if None).
+
+    Missing policies for time-matched stacks:
+    - "zeros": return an all-zero 8-band stack (warning emitted once).
+    - "skip": drop samples without a valid time-matched stack at init time.
+    - "raise": raise at __getitem__ if a time-matched stack is missing.
+
     The Dataset does not attempt to map weak<->strong IDs; it only uses the
     provided IDs or image paths.
     """
@@ -239,19 +254,23 @@ class SARDataset(Dataset):
         for sample in samples:
             img_path = sample["img_path"]
             mask_path = sample["mask_path"]
+            sample_id = sample["id"]
             try:
                 with rasterio.open(img_path) as src:
                     img_h, img_w = src.height, src.width
                     if src.count < 1:
-                        raise ValueError("Image has zero bands")
+                        raise ValueError(f"Image has zero bands (id='{sample_id}')")
 
                 if self.mode != "none":
                     if mask_path is None:
-                        raise ValueError("Missing mask path for labeled mode")
+                        raise ValueError(f"Missing mask path for labeled mode (id='{sample_id}')")
                     with rasterio.open(mask_path) as msrc:
                         mask_h, mask_w = msrc.height, msrc.width
                     if (img_h, img_w) != (mask_h, mask_w):
-                        raise ValueError("Mask shape does not match image shape")
+                        raise ValueError(
+                            f"Mask shape mismatch for id '{sample_id}': "
+                            f"mask {(mask_h, mask_w)} vs image {(img_h, img_w)}"
+                        )
 
                 valid.append(sample)
             except Exception as e:
@@ -279,15 +298,20 @@ class SARDataset(Dataset):
 
         raise ValueError(f"Unknown normalization type: {self._normalize_type}")
 
-    def _load_image(self, img_path: str) -> np.ndarray:
+    def _load_image(self, img_path: str, sample_id: str) -> np.ndarray:
         try:
             with rasterio.open(img_path) as src:
                 img = src.read()  # (C, H, W)
         except RasterioIOError as e:
-            raise RuntimeError(f"Failed to read image at '{img_path}': {e}") from e
+            raise RuntimeError(
+                f"Failed to read image for id '{sample_id}' at '{img_path}': {e}"
+            ) from e
 
         if img.ndim != 3:
-            raise ValueError(f"Expected image with 3 dimensions (C,H,W), got shape {img.shape}")
+            raise ValueError(
+                f"Expected image with 3 dimensions (C,H,W) for id '{sample_id}', "
+                f"got shape {img.shape}"
+            )
         img = img.astype(np.float32, copy=False)
 
         if self.log_transform:
@@ -324,7 +348,7 @@ class SARDataset(Dataset):
         img_path = sample["img_path"]
         mask_path = sample["mask_path"]
 
-        img = self._load_image(img_path)
+        img = self._load_image(img_path, sample_id)
         img_tensor = torch.from_numpy(img).float()
 
         mask_tensor: Optional[torch.Tensor] = None
@@ -341,17 +365,21 @@ class SARDataset(Dataset):
         }
 
         if self.use_time_matched:
+            metadata["time_matched_path"] = None
+            metadata["time_matched_status"] = None
             tm_path, tm_status = self._time_matched_path(sample)
             if tm_path is None:
                 if self.time_matched_missing_policy == "raise":
-                    raise RuntimeError(f"Missing time-matched stack for id '{sample_id}'")
+                    raise RuntimeError(
+                        f"Missing time-matched stack for id '{sample_id}' "
+                        f"(status={tm_status or 'missing'})"
+                    )
                 if self.time_matched_missing_policy == "zeros":
                     if not self._warned_missing_tm:
                         warnings.warn("Using zeros for missing time-matched stacks.")
                         self._warned_missing_tm = True
                     tm = np.zeros((8, img.shape[1], img.shape[2]), dtype=np.float32)
                     metadata["time_matched"] = torch.from_numpy(tm)
-                metadata["time_matched_path"] = None
                 metadata["time_matched_status"] = tm_status or "missing"
             else:
                 with rasterio.open(tm_path) as src:
