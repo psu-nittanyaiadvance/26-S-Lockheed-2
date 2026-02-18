@@ -1,0 +1,10 @@
+# GEE time-matched download config
+window_days_s1: 3
+window_days_s2: 14
+s2_cloud_pct: 20
+bands_s2: [B2, B3, B4, B8, B11, B12]
+export_scale_m: 10
+max_pixels: 100000000
+split_filter: null
+exclude_sen1floods11_exact_tiles: false
+expand_bbox_factor: 2.0
