@@ -93,6 +93,10 @@ print(std)
 '@ | python -
 ```
 
+**Data Loader**
+
+Detailed dataloader documentation lives in `src/data_loader/README.md`.
+
 **Docs**
 - `docs/DATA.md`: dataset layout, manifests, ID conventions
 - `docs/DATALOADER.md`: SARDataset, collate, splits, stats, validation
