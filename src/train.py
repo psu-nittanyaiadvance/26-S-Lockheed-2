@@ -1,4 +1,8 @@
 
+#main function
+if __name__ == "__main__":
+    pass
+
 
 """
 train_model() paramaters for adam optimizer and tversky loss
@@ -52,5 +56,10 @@ with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp)
         beta=tversky_beta
     )
 """
+
+
+
+
+
 
 
