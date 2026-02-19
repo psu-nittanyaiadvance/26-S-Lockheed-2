@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from .sar_dataset import TIME_MATCHED_ZEROS_WARNING
 
 def _as_numpy(arr: Any) -> np.ndarray:
     if isinstance(arr, torch.Tensor):
@@ -76,7 +77,7 @@ def validate_time_matched(ds: Any, n: int = 64) -> None:
     Validate time-matched stacks when ds.use_time_matched is enabled.
 
     Checks:
-    - time_matched is [8,H,W] when present, dtype float32
+    - time_matched is [B,H,W] when present, dtype float32 (B = expected_time_matched_bands)
     - missing policy behavior:
       - zeros: missing stacks return zeros (warning only once)
       - skip: missing stacks are filtered
@@ -89,6 +90,7 @@ def validate_time_matched(ds: Any, n: int = 64) -> None:
     _require(total > 0, "Dataset is empty")
 
     policy = getattr(ds, "time_matched_missing_policy", "zeros")
+    expected_bands = int(getattr(ds, "expected_time_matched_bands", 8))
     missing_statuses = {"missing", "missing_s1", "missing_s2", "missing_both"}
 
     missing_idx: Optional[int] = None
@@ -117,8 +119,8 @@ def validate_time_matched(ds: Any, n: int = 64) -> None:
 
         tm_np = _as_numpy(tm)
         _require(
-            tm_np.ndim == 3 and tm_np.shape[0] == 8,
-            f"time_matched must be [8,H,W] for id '{sample_id}', got {tm_np.shape}",
+            tm_np.ndim == 3 and tm_np.shape[0] == expected_bands,
+            f"time_matched must be [{expected_bands},H,W] for id '{sample_id}', got {tm_np.shape}",
         )
         _require(
             tm_np.dtype == np.float32,
@@ -166,7 +168,7 @@ def validate_time_matched(ds: Any, n: int = 64) -> None:
             _ = ds[missing_idx]
             _ = ds[missing_idx]
         warn_count = sum(
-            1 for w in caught if "zeros for missing time-matched" in str(w.message).lower()
+            1 for w in caught if str(w.message) == TIME_MATCHED_ZEROS_WARNING
         )
         if warn_count > 1:
             raise ValueError("Expected a single warning for missing time-matched zeros policy.")

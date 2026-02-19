@@ -1,7 +1,7 @@
-from .sar_dataset import SARDataset
-from .splits import make_split
+from .sar_dataset import SARDataset, TIME_MATCHED_ZEROS_WARNING
+from .splits import make_split, make_stratified_split
 from .stats import compute_running_mean_std
-from .collate import default_collate
+from .collate import default_collate, semi_supervised_collate
 from .discover_ids import list_ids_from_dir, paired_ids
 from .validate_dataset import (
     validate_manifest_consistency,
@@ -11,9 +11,12 @@ from .validate_dataset import (
 
 __all__ = [
     "SARDataset",
+    "TIME_MATCHED_ZEROS_WARNING",
     "make_split",
+    "make_stratified_split",
     "compute_running_mean_std",
     "default_collate",
+    "semi_supervised_collate",
     "list_ids_from_dir",
     "paired_ids",
     "validate_sample_shapes",

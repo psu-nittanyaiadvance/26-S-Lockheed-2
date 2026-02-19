@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import os
+import re
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
@@ -22,6 +23,21 @@ class Sample(TypedDict):
 NormalizeCfg = Union[str, Dict[str, Any], None]
 
 
+TIME_MATCHED_ZEROS_WARNING = "Using zeros for missing time-matched stacks."
+DEFAULT_SPLIT_TOKENS = (
+    "WeaklyLabeled",
+    "HandLabeled",
+    "weak",
+    "strong",
+    "Weak",
+    "Strong",
+)
+
+
+def _normalize_token(token: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", token.lower())
+
+
 def _is_tif_name(name: str) -> bool:
     ext = Path(name).suffix.lower()
     return ext in (".tif", ".tiff")
@@ -40,10 +56,18 @@ def _infer_ids_are_paths(items: Sequence[Union[str, Path]]) -> bool:
     return False
 
 
-def _infer_split_from_path(path: str) -> str:
+def _infer_split_from_path(path: str, split_tokens: Sequence[str]) -> str:
     parts = Path(path).parts
-    for token in ("WeaklyLabeled", "HandLabeled"):
-        if token in parts:
+    norm_parts = [_normalize_token(p) for p in parts]
+    for token in split_tokens:
+        norm_token = _normalize_token(token)
+        if norm_token and norm_token in norm_parts:
+            return token
+    for token in split_tokens:
+        norm_token = _normalize_token(token)
+        if not norm_token:
+            continue
+        if any(norm_token in part for part in norm_parts):
             return token
     return "all"
 
@@ -68,8 +92,9 @@ class SARDataset(Dataset):
       masks are still resolved under mask_root using the image stem.
 
     Time-matched behavior (use_time_matched=True):
-    - Reads an 8-band stack (VV, VH + 6x S2 bands) from time_matched_root/{split}/{id}.tif
-      or uses the time_matched_manifest if present.
+    - Reads a stack with expected_time_matched_bands (default 8) from
+      time_matched_root/{split}/{id}.tif or uses the time_matched_manifest if present.
+    - Split is inferred from the image path using split_tokens; metadata includes split_inferred.
     - Metadata always includes time_matched_status and time_matched_path (even if None).
 
     Missing policies for time-matched stacks:
@@ -79,6 +104,10 @@ class SARDataset(Dataset):
 
     The Dataset does not attempt to map weak<->strong IDs; it only uses the
     provided IDs or image paths.
+
+    Optional band-count checks:
+    - expected_img_bands validates the number of SAR bands at read time.
+    - expected_time_matched_bands validates the time-matched stack band count.
     """
 
     def __init__(
@@ -96,6 +125,9 @@ class SARDataset(Dataset):
         time_matched_root: Union[str, Path] = "data/derived/gee_time_matched",
         time_matched_manifest: Union[str, Path] = "data/derived/gee_time_matched_manifest.csv",
         time_matched_missing_policy: str = "zeros",
+        split_tokens: Optional[Sequence[str]] = DEFAULT_SPLIT_TOKENS,
+        expected_img_bands: Optional[int] = None,
+        expected_time_matched_bands: int = 8,
     ) -> None:
         if mode not in {"weak", "strong", "none"}:
             raise ValueError(f"mode must be one of 'weak', 'strong', 'none'; got {mode}")
@@ -130,10 +162,21 @@ class SARDataset(Dataset):
         self.time_matched_root = Path(time_matched_root)
         self.time_matched_manifest = Path(time_matched_manifest)
         self.time_matched_missing_policy = time_matched_missing_policy
+        if split_tokens is None:
+            split_tokens = DEFAULT_SPLIT_TOKENS
+        self.split_tokens = tuple(split_tokens)
+        self.expected_img_bands = expected_img_bands
+        self.expected_time_matched_bands = int(expected_time_matched_bands)
         if self.time_matched_missing_policy not in {"zeros", "skip", "raise"}:
             raise ValueError(
                 "time_matched_missing_policy must be one of {'zeros','skip','raise'}"
             )
+        if self.expected_img_bands is not None and self.expected_img_bands <= 0:
+            raise ValueError("expected_img_bands must be a positive integer")
+        if self.expected_time_matched_bands <= 0:
+            raise ValueError("expected_time_matched_bands must be a positive integer")
+        if not self.split_tokens:
+            raise ValueError("split_tokens must contain at least one token")
         self._tm_index: Dict[str, Dict[str, str]] = (
             self._load_time_matched_index() if self.use_time_matched else {}
         )
@@ -145,6 +188,20 @@ class SARDataset(Dataset):
         self._parse_normalize_cfg(normalize_cfg)
 
         self.samples: List[Sample] = self._build_samples(ids_or_paths)
+        if self.use_time_matched:
+            split_all = sum(
+                1
+                for s in self.samples
+                if _infer_split_from_path(s["img_path"], self.split_tokens) == "all"
+            )
+            if split_all:
+                ratio = split_all / max(len(self.samples), 1)
+                if ratio >= 0.5:
+                    warnings.warn(
+                        "Split inference fell back to 'all' for "
+                        f"{split_all}/{len(self.samples)} samples. "
+                        "Consider passing split_tokens that match your directory structure."
+                    )
         if self.use_time_matched and self.time_matched_missing_policy == "skip":
             self.samples = [s for s in self.samples if self._time_matched_exists(s)]
             if not self.samples:
@@ -170,14 +227,16 @@ class SARDataset(Dataset):
                 index[str(row["sample_id"])] = row
         return index
 
-    def _time_matched_path(self, sample: Sample) -> Tuple[Optional[Path], Optional[str]]:
+    def _time_matched_path(
+        self, sample: Sample, split_override: Optional[str] = None
+    ) -> Tuple[Optional[Path], Optional[str]]:
         sample_id = sample["id"]
         row = self._tm_index.get(sample_id)
         if row and row.get("status") == "ok" and row.get("path"):
             path = Path(row["path"])
             if path.exists():
                 return path, "ok"
-        split = _infer_split_from_path(sample["img_path"])
+        split = split_override or _infer_split_from_path(sample["img_path"], self.split_tokens)
         path = self.time_matched_root / split / f"{sample_id}.tif"
         if path.exists():
             return path, row.get("status") if row else "ok"
@@ -301,6 +360,11 @@ class SARDataset(Dataset):
     def _load_image(self, img_path: str, sample_id: str) -> np.ndarray:
         try:
             with rasterio.open(img_path) as src:
+                if self.expected_img_bands is not None and src.count != self.expected_img_bands:
+                    raise ValueError(
+                        f"Expected {self.expected_img_bands} image bands for id '{sample_id}', "
+                        f"got {src.count} at '{img_path}'"
+                    )
                 img = src.read()  # (C, H, W)
         except RasterioIOError as e:
             raise RuntimeError(
@@ -367,7 +431,9 @@ class SARDataset(Dataset):
         if self.use_time_matched:
             metadata["time_matched_path"] = None
             metadata["time_matched_status"] = None
-            tm_path, tm_status = self._time_matched_path(sample)
+            split_inferred = _infer_split_from_path(img_path, self.split_tokens)
+            metadata["split_inferred"] = split_inferred
+            tm_path, tm_status = self._time_matched_path(sample, split_override=split_inferred)
             if tm_path is None:
                 if self.time_matched_missing_policy == "raise":
                     raise RuntimeError(
@@ -376,18 +442,21 @@ class SARDataset(Dataset):
                     )
                 if self.time_matched_missing_policy == "zeros":
                     if not self._warned_missing_tm:
-                        warnings.warn("Using zeros for missing time-matched stacks.")
+                        warnings.warn(TIME_MATCHED_ZEROS_WARNING)
                         self._warned_missing_tm = True
-                    tm = np.zeros((8, img.shape[1], img.shape[2]), dtype=np.float32)
+                    tm = np.zeros(
+                        (self.expected_time_matched_bands, img.shape[1], img.shape[2]),
+                        dtype=np.float32,
+                    )
                     metadata["time_matched"] = torch.from_numpy(tm)
                 metadata["time_matched_status"] = tm_status or "missing"
             else:
                 with rasterio.open(tm_path) as src:
                     tm = src.read().astype(np.float32, copy=False)
-                if tm.ndim != 3 or tm.shape[0] != 8:
+                if tm.ndim != 3 or tm.shape[0] != self.expected_time_matched_bands:
                     raise ValueError(
-                        f"Expected time-matched stack with 8 bands for id '{sample_id}', "
-                        f"got shape {tm.shape}"
+                        f"Expected time-matched stack with {self.expected_time_matched_bands} "
+                        f"bands for id '{sample_id}', got shape {tm.shape}"
                     )
                 metadata["time_matched"] = torch.from_numpy(tm)
                 metadata["time_matched_path"] = str(tm_path)

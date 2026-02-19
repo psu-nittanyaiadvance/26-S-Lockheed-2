@@ -98,3 +98,55 @@ Validation helpers (`validate_dataset.py`):
   behavior.
 - `validate_manifest_consistency(path)` validates required manifest columns and
   allowed status values.
+
+**Usage Example**
+
+```python
+from pathlib import Path
+from torch.utils.data import DataLoader
+
+from src.data_loader import (
+    SARDataset,
+    compute_running_mean_std,
+    default_collate,
+    make_split,
+)
+
+img_root = Path("datasets/FilteredSouthAsia/WeaklyLabeled/S1Weak")
+weak_mask_root = Path("datasets/FilteredSouthAsia/WeaklyLabeled/S1OtsuLabelWeak")
+
+ids = ["tile_000123", "tile_000124", "tile_000125", "tile_000126"]
+train_ids, val_ids = make_split(ids, val_frac=0.2, seed=1337)
+
+train_raw = SARDataset(
+    img_root=img_root,
+    mask_root=weak_mask_root,
+    ids_or_paths=train_ids,
+    mode="weak",
+    normalize_cfg="none",
+    log_transform=True,
+    validate=True,
+)
+
+mean, std = compute_running_mean_std(train_raw, max_samples=512)
+
+train_ds = SARDataset(
+    img_root=img_root,
+    mask_root=weak_mask_root,
+    ids_or_paths=train_ids,
+    mode="weak",
+    normalize_cfg={"type": "zscore", "mean": mean, "std": std},
+    log_transform=True,
+)
+
+train_loader = DataLoader(
+    train_ds,
+    batch_size=4,
+    shuffle=True,
+    num_workers=0,
+    collate_fn=default_collate,
+)
+
+images, masks, metas = next(iter(train_loader))
+print(images.shape, masks.shape, metas[0]["id"])
+```

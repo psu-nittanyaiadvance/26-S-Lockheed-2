@@ -25,7 +25,7 @@ This document defines ablation axes and rules to prevent confounds when reportin
 **Recommended Minimal Ablation Table**
 
 | Modality | Labels | Notes |
-| --- | --- | --- |
+| -------- | --------- | ---------- |
 | SAR-only | strong-only | Baseline |
 | SAR+TM | strong-only | Same IDs, same split |
 | SAR-only | weak-only | Same IDs, same split |
