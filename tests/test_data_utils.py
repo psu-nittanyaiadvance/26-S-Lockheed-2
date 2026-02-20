@@ -14,6 +14,7 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+import pytest
 import rasterio
 from rasterio.transform import from_origin
 
@@ -27,6 +28,8 @@ from data_loader import (  # noqa: E402
     list_ids_from_dir,
     validate_time_matched,
 )
+
+pytestmark = pytest.mark.integration
 
 
 def _write_tif(path: Path, data: np.ndarray) -> None:
