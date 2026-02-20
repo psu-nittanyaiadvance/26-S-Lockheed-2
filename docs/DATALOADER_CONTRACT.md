@@ -5,6 +5,9 @@ This document defines the strict, testable interface contract between the data l
 
 Contract version: 1.2.0 (2026-02-20)
 
+## Changelog
+- 1.2.0 (2026-02-20): Documented strong-label encoding (-1/0/1) and standardized `ignore_mask` as always-present for labeled modes (all-false when unused).
+
 ## 2) Terminology (ID, split, mode, time-matched, weak/strong, labeled/unlabeled)
 ID: Filename stem of a SAR GeoTIFF (e.g., `tile_000123` from `tile_000123.tif`). IDs are the canonical sample identifiers.
 Split: Dataset partition token inferred from path or provided by the caller. For time-matched stacks, the loader infers `split_inferred` from image path tokens.
