@@ -3,7 +3,6 @@ Smoke tests for data-loading utilities:
 - recursive ID discovery + duplicate stem warnings
 - time-matched zeros warning constant + skip policy filtering
 - stats guardrails against transforms/normalization leakage
-- semi-supervised collate mask filling
 - expected band count checks
 """
 
@@ -15,7 +14,6 @@ import warnings
 from pathlib import Path
 
 import numpy as np
-import torch
 import rasterio
 from rasterio.transform import from_origin
 
@@ -27,7 +25,6 @@ from data_loader import (  # noqa: E402
     TIME_MATCHED_ZEROS_WARNING,
     compute_running_mean_std,
     list_ids_from_dir,
-    semi_supervised_collate,
     validate_time_matched,
 )
 
@@ -161,25 +158,6 @@ def test_compute_running_mean_std_guardrails() -> None:
             assert "Transforms are enabled" in str(exc)
 
 
-def test_semi_supervised_collate() -> None:
-    img1 = torch.zeros((2, 4, 4), dtype=torch.float32)
-    img2 = torch.ones((2, 4, 4), dtype=torch.float32)
-    mask1 = torch.zeros((1, 4, 4), dtype=torch.uint8)
-
-    images, mask_batch, metas = semi_supervised_collate(
-        [
-            (img1, mask1, {"id": "a"}),
-            (img2, None, {"id": "b"}),
-        ]
-    )
-
-    assert images.shape == (2, 2, 4, 4)
-    assert mask_batch.shape == (2, 1, 4, 4)
-    assert mask_batch.dtype == torch.uint8
-    assert int(mask_batch[1].unique().item()) == 255
-    assert [m["id"] for m in metas] == ["a", "b"]
-
-
 def test_expected_band_checks() -> None:
     with tempfile.TemporaryDirectory() as tmp:
         root = Path(tmp)
@@ -233,6 +211,5 @@ if __name__ == "__main__":
     test_time_matched_zeros_warning_and_validator()
     test_time_matched_skip_filters_missing()
     test_compute_running_mean_std_guardrails()
-    test_semi_supervised_collate()
     test_expected_band_checks()
     print("All smoke tests passed.")

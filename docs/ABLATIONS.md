@@ -22,16 +22,16 @@ This document defines ablation axes and rules to prevent confounds when reportin
 - Normalization config and whether mean/std were computed on train split only.
 - Channel counts (SAR-only=2; SAR+TM=8).
 
-**Recommended Minimal Ablation Table**
+**Planned Ablation Matrix (Modality + Weak-Label Viability)**
 
-| Modality | Labels | Notes |
-| -------- | --------- | ---------- |
-| SAR-only | strong-only | Baseline |
-| SAR+TM | strong-only | Same IDs, same split |
-| SAR-only | weak-only | Same IDs, same split |
-| SAR+TM | weak-only | Same IDs, same split |
-
-Optional later phase: weak->strong (treat as separate label-regime axis, not directly comparable).
+| Run | Modality | Pretrain | Train/Fine-tune | Key Purpose |
+| --- | --- | --- | --- | --- |
+| R1 | SAR | None | Strong only | Baseline |
+| R2 | SAR | None | Weak only | Weak-label viability |
+| R3 | SAR | None | Strong + Weak | Mixture of labels viability |
+| R4 | SAR | Weak Sen1Floods11 | Strong finetune | Weak-label benefit (SAR) |
+| R5 | SAR | SSL SEN12MS | Strong finetune | Modality baseline |
+| R6 | SAR+Opt | SSL SEN12MS | Strong finetune | Modality effect (SSL-controlled) |
 
 **Handling Missing Time-Matched**
 - `zeros` is allowed only if you report the % missing.
