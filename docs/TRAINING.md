@@ -46,6 +46,9 @@ Common causes for ~0 IoU/Dice in small debug runs:
 4. Class imbalance: tiny positive fractions can make early metrics look near-zero even when training is fine.
 5. Patches vs full frames: patches change the positive fraction per batch, so metrics can shift sharply.
 
+Metric policy note:
+- For binary IoU/Dice, batches with union=0 are excluded from accumulation. If all batches are excluded, IoU/Dice are `nan`, and the training loop tracks `skipped_batches` for diagnostics.
+
 Recommended debug commands:
 ```powershell
 # Full-frame, single-batch sanity check with batch diagnostics

@@ -573,18 +573,49 @@ def _debug_batch(
 def _extract_ignore_mask(
     metas: List[Dict],
     device: torch.device,
+    masks: Optional[torch.Tensor],
 ) -> Optional[torch.Tensor]:
-    if not metas or not all("ignore_mask" in m for m in metas):
+    if masks is None:
         return None
-    masks: List[torch.Tensor] = []
-    for meta in metas:
-        mask = meta.get("ignore_mask")
-        if mask is None:
-            return None
-        if not isinstance(mask, torch.Tensor):
-            mask = torch.as_tensor(mask)
-        masks.append(mask)
-    ignore = torch.stack(masks, dim=0).to(device, non_blocking=True)
+    if not isinstance(masks, torch.Tensor):
+        return None
+    if masks.ndim == 4:
+        batch, _, height, width = masks.shape
+    elif masks.ndim == 3:
+        batch, height, width = masks.shape
+    else:
+        return None
+    if len(metas) not in (0, batch):
+        raise ValueError(
+            f"metas length ({len(metas)}) does not match batch size ({batch})"
+        )
+
+    ignore_list: List[torch.Tensor] = []
+    # Treat missing ignore_mask metadata as all-false to keep masking consistent.
+    for i in range(batch):
+        meta = metas[i] if i < len(metas) else {}
+        raw = meta.get("ignore_mask")
+        if raw is None:
+            ignore = torch.zeros((1, height, width), dtype=torch.bool)
+        else:
+            if not isinstance(raw, torch.Tensor):
+                raw = torch.as_tensor(raw)
+            if raw.ndim == 2:
+                raw = raw.unsqueeze(0)
+            if raw.ndim != 3 or raw.shape[0] != 1:
+                raise ValueError(
+                    f"ignore_mask must have shape [1,H,W]; got {tuple(raw.shape)}"
+                )
+            if tuple(raw.shape[1:]) != (height, width):
+                sample_id = meta.get("id", f"index_{i}")
+                raise ValueError(
+                    "ignore_mask spatial shape mismatch for "
+                    f"{sample_id}: got {tuple(raw.shape[1:])}, expected {(height, width)}"
+                )
+            ignore = raw.to(dtype=torch.bool)
+        ignore_list.append(ignore)
+
+    ignore = torch.stack(ignore_list, dim=0).to(device, non_blocking=True)
     return ignore
 
 
@@ -609,7 +640,7 @@ def train_epoch(
 
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        ignore_mask = _extract_ignore_mask(metas, device)
+        ignore_mask = _extract_ignore_mask(metas, device, masks)
 
         if args.use_time_matched:
             images = concat_time_matched(images, metas, tm_norm).to(device, non_blocking=True)
@@ -639,7 +670,14 @@ def train_epoch(
                         loss = logits.sum() * 0.0
             else:
                 targets = masks.squeeze(1).long()
-                loss = F.cross_entropy(logits, targets)
+                if ignore_mask is not None:
+                    ignore_index = 255
+                    ignore = ignore_mask.squeeze(1).bool()
+                    targets = targets.clone()
+                    targets[ignore] = ignore_index
+                    loss = F.cross_entropy(logits, targets, ignore_index=ignore_index)
+                else:
+                    loss = F.cross_entropy(logits, targets)
 
         if args.debug_batch and not debug_printed:
             _debug_batch("train", images, masks, logits, args, ignore_mask=ignore_mask)
@@ -688,7 +726,7 @@ def eval_epoch(
 
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
-        ignore_mask = _extract_ignore_mask(metas, device)
+        ignore_mask = _extract_ignore_mask(metas, device, masks)
 
         if args.use_time_matched:
             images = concat_time_matched(images, metas, tm_norm).to(device, non_blocking=True)
@@ -716,7 +754,14 @@ def eval_epoch(
                     loss = logits.sum() * 0.0
         else:
             targets = masks.squeeze(1).long()
-            loss = F.cross_entropy(logits, targets)
+            if ignore_mask is not None:
+                ignore_index = 255
+                ignore = ignore_mask.squeeze(1).bool()
+                targets = targets.clone()
+                targets[ignore] = ignore_index
+                loss = F.cross_entropy(logits, targets, ignore_index=ignore_index)
+            else:
+                loss = F.cross_entropy(logits, targets)
 
         if args.debug_batch and not debug_printed:
             _debug_batch("val", images, masks, logits, args, ignore_mask=ignore_mask)

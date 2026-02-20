@@ -3,7 +3,7 @@
 ## 1) Purpose and Scope
 This document defines the strict, testable interface contract between the data loader and the training loop. It is the single source of truth for tensor shapes, dtypes, metadata keys, valid enum values, and failure modes. The goal is to allow independent development without cross-editing code.
 
-Contract version: 1.1.0 (2026-02-20)
+Contract version: 1.2.0 (2026-02-20)
 
 ## 2) Terminology (ID, split, mode, time-matched, weak/strong, labeled/unlabeled)
 ID: Filename stem of a SAR GeoTIFF (e.g., `tile_000123` from `tile_000123.tif`). IDs are the canonical sample identifiers.
@@ -74,8 +74,8 @@ Required keys always present:
 - `img_path`: `str` (resolved image path)
 - `mask_path`: `str | None` (resolved mask path, `None` if `mode="none"`)
 
-Optional keys when masks contain negative values:
-- `ignore_mask`: `torch.Tensor` with shape `[1, H, W]` and dtype `torch.bool`. Pixels marked `True` should be excluded from loss/metrics.
+Standard keys for labeled modes (`mode in {"weak","strong"}`):
+- `ignore_mask`: `torch.Tensor` with shape `[1, H, W]` and dtype `torch.bool`. Pixels marked `True` should be excluded from loss/metrics. This is always present for labeled samples; if there are no ignored pixels it is an all-false tensor.
 
 Required keys when `use_time_matched=True`:
 - `time_matched`: `torch.Tensor` with shape `[8, H, W]` and dtype `torch.float32` when available, or a zeros tensor if missing policy is `zeros`
@@ -87,11 +87,11 @@ Integration-required fields:
 - `mode` and `has_mask` are required for the training loop but are not stored in `metadata`. The training loop must track `mode` from dataset config and derive `has_mask` as `mask is not None`.
 
 ## 6) Mask Semantics
-Label encoding:
-- Masks are binarized on load using `mask > 0`.
-- Output dtype is `uint8`.
+Label encoding (strong labels on disk):
+- Raw masks use `-1` for ignore, `0` for background, `1` for flood.
+- Masks are binarized on load using `mask > 0` and output as `uint8`.
 Ignore index:
-- This contract does not encode ignore values in the mask tensor. If a raw mask contains negative values, they are exposed via `metadata["ignore_mask"]` so the training loop can exclude those pixels from loss/metrics.
+- This contract does not encode ignore values in the mask tensor. Instead `metadata["ignore_mask"]` (shape `[1,H,W]`, `bool`) marks ignored pixels and is always present for labeled modes (all-false when no ignores).
 When masks may be missing:
 - `mode="none"`: masks are always `None`.
 - `mode in {"weak","strong"}`: masks must exist; missing masks raise at access.

@@ -401,7 +401,7 @@ class SARDataset(Dataset):
         mask_path: str,
         expected_hw: Tuple[int, int],
         sample_id: str,
-    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    ) -> Tuple[np.ndarray, np.ndarray]:
         try:
             with rasterio.open(mask_path) as src:
                 if src.count >= 1:
@@ -419,11 +419,7 @@ class SARDataset(Dataset):
 
         ignore = mask < 0
         mask_bin = (mask > 0).astype(np.uint8)
-        ignore_mask = ignore.astype(bool, copy=False)
-        if not ignore_mask.any():
-            ignore_mask = None
-        else:
-            ignore_mask = ignore_mask[None, :, :]
+        ignore_mask = ignore.astype(bool, copy=False)[None, :, :]
         return mask_bin[None, :, :], ignore_mask
 
     def __len__(self) -> int:
@@ -450,8 +446,8 @@ class SARDataset(Dataset):
                 raise RuntimeError(f"Missing mask path for id '{sample_id}'")
             mask, ignore_mask = self._load_mask(mask_path, (img.shape[1], img.shape[2]), sample_id)
             mask_tensor = torch.from_numpy(mask)
-            if ignore_mask is not None:
-                metadata["ignore_mask"] = torch.from_numpy(ignore_mask)
+            # Always provide ignore_mask for labeled modes (all-false if no ignored pixels).
+            metadata["ignore_mask"] = torch.from_numpy(ignore_mask)
 
         if self.use_time_matched:
             metadata["time_matched_path"] = None
@@ -488,6 +484,7 @@ class SARDataset(Dataset):
                 metadata["time_matched_status"] = tm_status or "ok"
 
         if self.transforms is not None:
+            had_ignore = "ignore_mask" in metadata
             out = self.transforms(img_tensor, mask_tensor, metadata)
             if isinstance(out, tuple) and len(out) == 3:
                 img_tensor, mask_tensor, metadata = out
@@ -495,5 +492,41 @@ class SARDataset(Dataset):
                 img_tensor, mask_tensor = out
             else:
                 raise ValueError("transforms must return (image, mask, metadata) or (image, mask)")
+            if mask_tensor is None:
+                if "ignore_mask" in metadata:
+                    raise ValueError(
+                        "transforms introduced ignore_mask for an unlabeled sample; "
+                        "ignore_mask should be absent when mask is None."
+                    )
+            else:
+                if had_ignore and "ignore_mask" not in metadata:
+                    raise ValueError(
+                        "transforms dropped metadata['ignore_mask']; "
+                        "return updated metadata or do not mutate it."
+                    )
+                if "ignore_mask" in metadata:
+                    ignore_mask = metadata["ignore_mask"]
+                    if not isinstance(ignore_mask, torch.Tensor):
+                        ignore_mask = torch.as_tensor(ignore_mask)
+                    if ignore_mask.ndim == 2:
+                        ignore_mask = ignore_mask.unsqueeze(0)
+                    if ignore_mask.ndim != 3 or ignore_mask.shape[0] != 1:
+                        raise ValueError(
+                            f"ignore_mask must have shape [1,H,W]; got {tuple(ignore_mask.shape)}"
+                        )
+                    if mask_tensor.ndim == 2:
+                        expected_hw = tuple(mask_tensor.shape)
+                    elif mask_tensor.ndim == 3:
+                        expected_hw = tuple(mask_tensor.shape[1:])
+                    else:
+                        raise ValueError(
+                            f"mask must have shape [1,H,W] or [H,W]; got {tuple(mask_tensor.shape)}"
+                        )
+                    if tuple(ignore_mask.shape[1:]) != expected_hw:
+                        raise ValueError(
+                            "ignore_mask spatial shape mismatch: "
+                            f"got {tuple(ignore_mask.shape[1:])}, expected {expected_hw}"
+                        )
+                    metadata["ignore_mask"] = ignore_mask
 
         return img_tensor, mask_tensor, metadata
