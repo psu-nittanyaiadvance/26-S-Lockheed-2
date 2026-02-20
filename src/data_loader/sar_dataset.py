@@ -90,6 +90,7 @@ class SARDataset(Dataset):
     - IDs (e.g., "tile_000123"): resolved under img_root and mask_root.
     - Paths (absolute or containing separators, or .tif/.tiff suffix): used directly for images;
       masks are still resolved under mask_root using the image stem.
+    - mask_id_suffix_map can rewrite the image stem when resolving mask filenames.
 
     Time-matched behavior (use_time_matched=True):
     - Reads a stack with expected_time_matched_bands (default 8) from
@@ -121,6 +122,7 @@ class SARDataset(Dataset):
         log_transform: bool = False,
         validate: bool = False,
         ids_are_paths: Optional[bool] = None,
+        mask_id_suffix_map: Optional[Dict[str, str]] = None,
         use_time_matched: bool = False,
         time_matched_root: Union[str, Path] = "data/derived/gee_time_matched",
         time_matched_manifest: Union[str, Path] = "data/derived/gee_time_matched_manifest.csv",
@@ -138,6 +140,7 @@ class SARDataset(Dataset):
         self.mode = mode
         self.transforms = transforms
         self.log_transform = bool(log_transform)
+        self.mask_id_suffix_map = dict(mask_id_suffix_map) if mask_id_suffix_map else None
 
         if ids_are_paths is None:
             ids_are_paths = _infer_ids_are_paths(ids_or_paths)
@@ -280,6 +283,14 @@ class SARDataset(Dataset):
             return tiff
         return tif
 
+    def _resolve_mask_id(self, sample_id: str) -> str:
+        if not self.mask_id_suffix_map:
+            return sample_id
+        for img_suffix, mask_suffix in self.mask_id_suffix_map.items():
+            if sample_id.endswith(img_suffix):
+                return f"{sample_id[:-len(img_suffix)]}{mask_suffix}"
+        return sample_id
+
     def _build_samples(self, ids_or_paths: Sequence[Union[str, Path]]) -> List[Sample]:
         samples: List[Sample] = []
         for item in ids_or_paths:
@@ -297,7 +308,8 @@ class SARDataset(Dataset):
             if self.mode != "none":
                 if self.mask_root is None:
                     raise ValueError("mask_root is required for labeled modes")
-                mask_path = self._resolve_raster_path(self.mask_root, sample_id)
+                mask_id = self._resolve_mask_id(sample_id)
+                mask_path = self._resolve_raster_path(self.mask_root, mask_id)
 
             samples.append(
                 {
@@ -384,7 +396,12 @@ class SARDataset(Dataset):
         img = self._apply_normalization(img)
         return img
 
-    def _load_mask(self, mask_path: str, expected_hw: Tuple[int, int], sample_id: str) -> np.ndarray:
+    def _load_mask(
+        self,
+        mask_path: str,
+        expected_hw: Tuple[int, int],
+        sample_id: str,
+    ) -> Tuple[np.ndarray, Optional[np.ndarray]]:
         try:
             with rasterio.open(mask_path) as src:
                 if src.count >= 1:
@@ -400,8 +417,14 @@ class SARDataset(Dataset):
                 f"mask {mask.shape}, image {expected_hw}"
             )
 
+        ignore = mask < 0
         mask_bin = (mask > 0).astype(np.uint8)
-        return mask_bin[None, :, :]
+        ignore_mask = ignore.astype(bool, copy=False)
+        if not ignore_mask.any():
+            ignore_mask = None
+        else:
+            ignore_mask = ignore_mask[None, :, :]
+        return mask_bin[None, :, :], ignore_mask
 
     def __len__(self) -> int:
         return len(self.samples)
@@ -412,6 +435,12 @@ class SARDataset(Dataset):
         img_path = sample["img_path"]
         mask_path = sample["mask_path"]
 
+        metadata: Dict[str, Any] = {
+            "id": sample_id,
+            "img_path": img_path,
+            "mask_path": mask_path,
+        }
+
         img = self._load_image(img_path, sample_id)
         img_tensor = torch.from_numpy(img).float()
 
@@ -419,14 +448,10 @@ class SARDataset(Dataset):
         if self.mode != "none":
             if mask_path is None:
                 raise RuntimeError(f"Missing mask path for id '{sample_id}'")
-            mask = self._load_mask(mask_path, (img.shape[1], img.shape[2]), sample_id)
+            mask, ignore_mask = self._load_mask(mask_path, (img.shape[1], img.shape[2]), sample_id)
             mask_tensor = torch.from_numpy(mask)
-
-        metadata: Dict[str, Any] = {
-            "id": sample_id,
-            "img_path": img_path,
-            "mask_path": mask_path,
-        }
+            if ignore_mask is not None:
+                metadata["ignore_mask"] = torch.from_numpy(ignore_mask)
 
         if self.use_time_matched:
             metadata["time_matched_path"] = None

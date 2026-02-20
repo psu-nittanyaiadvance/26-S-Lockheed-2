@@ -219,6 +219,13 @@ class PatchDataset(Dataset):
         patch_meta["patch_y0"] = y0
         patch_meta["patch_x0"] = x0
         patch_meta["patch_size"] = ps
+        if "ignore_mask" in meta:
+            ignore_mask = meta["ignore_mask"]
+            if isinstance(ignore_mask, torch.Tensor):
+                if ignore_mask.ndim == 3:
+                    patch_meta["ignore_mask"] = ignore_mask[:, y0 : y0 + ps, x0 : x0 + ps]
+                elif ignore_mask.ndim == 2:
+                    patch_meta["ignore_mask"] = ignore_mask[y0 : y0 + ps, x0 : x0 + ps]
 
         return img_patch, mask_patch, patch_meta
 
