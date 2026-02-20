@@ -496,13 +496,15 @@ class SARDataset(Dataset):
                 if "ignore_mask" in metadata:
                     raise ValueError(
                         "transforms introduced ignore_mask for an unlabeled sample; "
-                        "ignore_mask should be absent when mask is None."
+                        "ignore_mask should be absent when mask is None "
+                        f"(id='{sample_id}')."
                     )
             else:
                 if had_ignore and "ignore_mask" not in metadata:
                     raise ValueError(
                         "transforms dropped metadata['ignore_mask']; "
-                        "return updated metadata or do not mutate it."
+                        "return updated metadata or do not mutate it "
+                        f"(id='{sample_id}')."
                     )
                 if "ignore_mask" in metadata:
                     ignore_mask = metadata["ignore_mask"]
@@ -512,7 +514,8 @@ class SARDataset(Dataset):
                         ignore_mask = ignore_mask.unsqueeze(0)
                     if ignore_mask.ndim != 3 or ignore_mask.shape[0] != 1:
                         raise ValueError(
-                            f"ignore_mask must have shape [1,H,W]; got {tuple(ignore_mask.shape)}"
+                            f"ignore_mask must have shape [1,H,W]; got {tuple(ignore_mask.shape)} "
+                            f"(id='{sample_id}')"
                         )
                     if mask_tensor.ndim == 2:
                         expected_hw = tuple(mask_tensor.shape)
@@ -520,12 +523,14 @@ class SARDataset(Dataset):
                         expected_hw = tuple(mask_tensor.shape[1:])
                     else:
                         raise ValueError(
-                            f"mask must have shape [1,H,W] or [H,W]; got {tuple(mask_tensor.shape)}"
+                            f"mask must have shape [1,H,W] or [H,W]; got {tuple(mask_tensor.shape)} "
+                            f"(id='{sample_id}')"
                         )
                     if tuple(ignore_mask.shape[1:]) != expected_hw:
                         raise ValueError(
                             "ignore_mask spatial shape mismatch: "
-                            f"got {tuple(ignore_mask.shape[1:])}, expected {expected_hw}"
+                            f"got {tuple(ignore_mask.shape[1:])}, expected {expected_hw} "
+                            f"(id='{sample_id}')"
                         )
                     metadata["ignore_mask"] = ignore_mask
 

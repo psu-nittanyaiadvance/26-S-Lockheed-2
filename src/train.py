@@ -75,6 +75,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--mask-root", type=Path, default=None)
     parser.add_argument("--mask-suffix-map", type=str, default=None)
     parser.add_argument("--debug-batch", action="store_true", default=False)
+    parser.add_argument("--validate-batch", action="store_true", default=False)
 
     parser.add_argument("--num-workers", type=int, default=0)
     parser.add_argument("--output-dir", type=Path, default=Path("runs/unet"))
@@ -493,6 +494,131 @@ def _maybe_channel_stats(tensor: torch.Tensor) -> Optional[str]:
     return f"per_channel_mean=[{mean_str}] per_channel_std=[{std_str}]"
 
 
+def _meta_context(meta: Dict, default_label: str = "sample") -> str:
+    sample_id = meta.get("id") or meta.get("base_id") or default_label
+    ctx = f"id={sample_id}"
+    if "base_id" in meta:
+        ctx += f" base_id={meta.get('base_id')}"
+    if "patch_y0" in meta and "patch_x0" in meta:
+        ctx += f" patch_y0={meta.get('patch_y0')} patch_x0={meta.get('patch_x0')}"
+    if "patch_size" in meta:
+        ctx += f" patch_size={meta.get('patch_size')}"
+    return ctx
+
+
+def validate_batch(
+    images: torch.Tensor,
+    masks: Optional[torch.Tensor],
+    metas: List[Dict],
+    *,
+    expect_masks: bool,
+    expect_time_matched: bool,
+    classes: int,
+) -> None:
+    if not isinstance(images, torch.Tensor):
+        raise ValueError("images must be a torch.Tensor")
+    if images.ndim != 4:
+        raise ValueError(f"images must have shape [B,C,H,W]; got {tuple(images.shape)}")
+    if not images.is_floating_point():
+        raise ValueError(f"images must be floating point; got dtype={images.dtype}")
+    if not torch.isfinite(images).all():
+        raise ValueError("images contain non-finite values")
+
+    batch, _, height, width = images.shape
+    if len(metas) != batch:
+        raise ValueError(f"metas length ({len(metas)}) does not match batch size ({batch})")
+
+    if expect_masks:
+        if masks is None:
+            raise ValueError("masks are required but missing")
+        if not isinstance(masks, torch.Tensor):
+            raise ValueError("masks must be a torch.Tensor when present")
+        if masks.ndim == 4:
+            if masks.shape[1] != 1:
+                raise ValueError(f"masks must have channel dim=1; got {tuple(masks.shape)}")
+            mask_hw = tuple(masks.shape[2:])
+        elif masks.ndim == 3:
+            if classes == 1:
+                raise ValueError("binary masks must have shape [B,1,H,W]")
+            mask_hw = tuple(masks.shape[1:])
+        else:
+            raise ValueError(f"masks must have shape [B,1,H,W] or [B,H,W]; got {tuple(masks.shape)}")
+        if mask_hw != (height, width):
+            raise ValueError(
+                f"mask spatial shape mismatch: got {mask_hw}, expected {(height, width)}"
+            )
+
+        if classes == 1:
+            mask_vals = masks
+            if mask_vals.is_floating_point():
+                tol = 1e-3
+                if not torch.isfinite(mask_vals).all():
+                    raise ValueError("mask contains non-finite values")
+                if not ((mask_vals >= -tol) & (mask_vals <= 1.0 + tol)).all():
+                    raise ValueError("binary mask values must be within [0,1]")
+                if not (mask_vals - mask_vals.round()).abs().le(tol).all():
+                    raise ValueError("binary mask values must be near {0,1}")
+            else:
+                unique = torch.unique(mask_vals)
+                if not torch.all((unique == 0) | (unique == 1)):
+                    raise ValueError(f"binary mask values must be {{0,1}}; got {unique.tolist()}")
+
+        for i, meta in enumerate(metas):
+            if "ignore_mask" not in meta:
+                raise ValueError(f"ignore_mask missing for labeled sample ({_meta_context(meta, f'index_{i}')})")
+            ignore = meta.get("ignore_mask")
+            if not isinstance(ignore, torch.Tensor):
+                ignore = torch.as_tensor(ignore)
+            if ignore.ndim == 2:
+                ignore = ignore.unsqueeze(0)
+            if ignore.ndim != 3 or ignore.shape[0] != 1:
+                raise ValueError(
+                    f"ignore_mask must have shape [1,H,W]; got {tuple(ignore.shape)} "
+                    f"({_meta_context(meta, f'index_{i}')})"
+                )
+            if tuple(ignore.shape[1:]) != (height, width):
+                raise ValueError(
+                    f"ignore_mask spatial mismatch: got {tuple(ignore.shape[1:])}, "
+                    f"expected {(height, width)} ({_meta_context(meta, f'index_{i}')})"
+                )
+            if ignore.dtype != torch.bool:
+                raise ValueError(
+                    f"ignore_mask must be bool; got {ignore.dtype} ({_meta_context(meta, f'index_{i}')})"
+                )
+    else:
+        if masks is not None:
+            raise ValueError("masks provided for an unlabeled batch")
+
+    if expect_time_matched:
+        for i, meta in enumerate(metas):
+            if "time_matched" not in meta:
+                raise ValueError(f"time_matched missing ({_meta_context(meta, f'index_{i}')})")
+            tm = meta.get("time_matched")
+            if not isinstance(tm, torch.Tensor):
+                tm = torch.as_tensor(tm)
+            if tm.ndim != 3:
+                raise ValueError(
+                    f"time_matched must have shape [C,H,W]; got {tuple(tm.shape)} "
+                    f"({_meta_context(meta, f'index_{i}')})"
+                )
+            tm_h, tm_w = tm.shape[1], tm.shape[2]
+            if (tm_h, tm_w) != (height, width):
+                y0 = meta.get("patch_y0")
+                x0 = meta.get("patch_x0")
+                if y0 is None or x0 is None:
+                    raise ValueError(
+                        "time_matched spatial mismatch and no patch coords; "
+                        f"got {(tm_h, tm_w)}, expected {(height, width)} "
+                        f"({_meta_context(meta, f'index_{i}')})"
+                    )
+                if y0 < 0 or x0 < 0 or y0 + height > tm_h or x0 + width > tm_w:
+                    raise ValueError(
+                        "patch coords out of bounds for time_matched: "
+                        f"tm={(tm_h, tm_w)} patch={(height, width)} "
+                        f"y0={y0} x0={x0} ({_meta_context(meta, f'index_{i}')})"
+                    )
+
+
 def _debug_batch(
     tag: str,
     images: torch.Tensor,
@@ -578,13 +704,16 @@ def _extract_ignore_mask(
     if masks is None:
         return None
     if not isinstance(masks, torch.Tensor):
-        return None
+        raise ValueError("masks must be a torch.Tensor to infer ignore_mask shape")
     if masks.ndim == 4:
         batch, _, height, width = masks.shape
     elif masks.ndim == 3:
         batch, height, width = masks.shape
     else:
-        return None
+        raise ValueError(
+            f"masks must have shape [B,1,H,W] or [B,H,W] to infer ignore_mask; "
+            f"got {tuple(masks.shape)}"
+        )
     if len(metas) not in (0, batch):
         raise ValueError(
             f"metas length ({len(metas)}) does not match batch size ({batch})"
@@ -607,7 +736,7 @@ def _extract_ignore_mask(
                     f"ignore_mask must have shape [1,H,W]; got {tuple(raw.shape)}"
                 )
             if tuple(raw.shape[1:]) != (height, width):
-                sample_id = meta.get("id", f"index_{i}")
+                sample_id = _meta_context(meta, f"index_{i}")
                 raise ValueError(
                     "ignore_mask spatial shape mismatch for "
                     f"{sample_id}: got {tuple(raw.shape[1:])}, expected {(height, width)}"
@@ -617,6 +746,19 @@ def _extract_ignore_mask(
 
     ignore = torch.stack(ignore_list, dim=0).to(device, non_blocking=True)
     return ignore
+
+
+def _apply_ignore_index(
+    targets: torch.Tensor,
+    ignore_mask: Optional[torch.Tensor],
+    ignore_index: int,
+) -> torch.Tensor:
+    if ignore_mask is None:
+        return targets
+    ignore = ignore_mask.squeeze(1).bool()
+    targets = targets.clone()
+    targets[ignore] = ignore_index
+    return targets
 
 
 def train_epoch(
@@ -640,6 +782,15 @@ def train_epoch(
 
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        if args.debug_batch or args.validate_batch:
+            validate_batch(
+                images,
+                masks,
+                metas,
+                expect_masks=True,
+                expect_time_matched=args.use_time_matched,
+                classes=args.classes,
+            )
         ignore_mask = _extract_ignore_mask(metas, device, masks)
 
         if args.use_time_matched:
@@ -672,9 +823,7 @@ def train_epoch(
                 targets = masks.squeeze(1).long()
                 if ignore_mask is not None:
                     ignore_index = 255
-                    ignore = ignore_mask.squeeze(1).bool()
-                    targets = targets.clone()
-                    targets[ignore] = ignore_index
+                    targets = _apply_ignore_index(targets, ignore_mask, ignore_index)
                     loss = F.cross_entropy(logits, targets, ignore_index=ignore_index)
                 else:
                     loss = F.cross_entropy(logits, targets)
@@ -703,6 +852,11 @@ def train_epoch(
             break
 
     metrics = finalize_metrics(metric_state, args.classes)
+    if (args.debug_batch or args.validate_batch) and args.classes == 1:
+        print(
+            f"[train] skipped_batches={metric_state['skipped_batches']} "
+            f"valid_batches={metric_state['valid_batches']}"
+        )
     return total_loss / max(n_batches, 1), metrics
 
 
@@ -726,6 +880,15 @@ def eval_epoch(
 
         images = images.to(device, non_blocking=True)
         masks = masks.to(device, non_blocking=True)
+        if args.debug_batch or args.validate_batch:
+            validate_batch(
+                images,
+                masks,
+                metas,
+                expect_masks=True,
+                expect_time_matched=args.use_time_matched,
+                classes=args.classes,
+            )
         ignore_mask = _extract_ignore_mask(metas, device, masks)
 
         if args.use_time_matched:
@@ -756,9 +919,7 @@ def eval_epoch(
             targets = masks.squeeze(1).long()
             if ignore_mask is not None:
                 ignore_index = 255
-                ignore = ignore_mask.squeeze(1).bool()
-                targets = targets.clone()
-                targets[ignore] = ignore_index
+                targets = _apply_ignore_index(targets, ignore_mask, ignore_index)
                 loss = F.cross_entropy(logits, targets, ignore_index=ignore_index)
             else:
                 loss = F.cross_entropy(logits, targets)
@@ -780,6 +941,11 @@ def eval_epoch(
             break
 
     metrics = finalize_metrics(metric_state, args.classes)
+    if (args.debug_batch or args.validate_batch) and args.classes == 1:
+        print(
+            f"[val] skipped_batches={metric_state['skipped_batches']} "
+            f"valid_batches={metric_state['valid_batches']}"
+        )
     return total_loss / max(n_batches, 1), metrics
 
 
@@ -793,6 +959,8 @@ def main() -> None:
         raise ValueError("BCE loss expects classes=1. Use a multiclass loss if needed.")
     if args.loss == "ce" and args.classes <= 1:
         raise ValueError("Cross-entropy loss expects classes > 1.")
+    if args.loss == "ce" and args.classes >= 255:
+        raise ValueError("Cross-entropy ignore_index uses 255; set classes < 255.")
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     amp_enabled = bool(args.amp and device.type == "cuda")
@@ -801,22 +969,18 @@ def main() -> None:
 
     train_ds, val_ds, tm_stats = build_datasets(args)
 
-    train_loader = DataLoader(
-        train_ds,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=default_collate,
-    )
-    val_loader = DataLoader(
-        val_ds,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=args.num_workers,
-        pin_memory=torch.cuda.is_available(),
-        collate_fn=default_collate,
-    )
+    loader_kwargs = {
+        "batch_size": args.batch_size,
+        "num_workers": args.num_workers,
+        "pin_memory": torch.cuda.is_available(),
+        "collate_fn": default_collate,
+    }
+    if args.num_workers > 0:
+        loader_kwargs["persistent_workers"] = True
+        loader_kwargs["prefetch_factor"] = 2
+
+    train_loader = DataLoader(train_ds, shuffle=True, **loader_kwargs)
+    val_loader = DataLoader(val_ds, shuffle=False, **loader_kwargs)
 
     sample_img, _, sample_meta = train_ds[0]
     n_channels = int(sample_img.shape[0])

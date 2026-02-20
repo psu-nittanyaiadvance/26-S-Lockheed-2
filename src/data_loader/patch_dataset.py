@@ -229,8 +229,11 @@ class PatchDataset(Dataset):
                 elif ignore_mask.ndim == 2:
                     patch_meta["ignore_mask"] = ignore_mask[y0 : y0 + ps, x0 : x0 + ps]
                 else:
+                    base_id = meta.get("id", f"base_{pi.base_idx}")
                     raise ValueError(
-                        f"ignore_mask must have shape [1,H,W] or [H,W]; got {tuple(ignore_mask.shape)}"
+                        "ignore_mask must have shape [1,H,W] or [H,W]; "
+                        f"got {tuple(ignore_mask.shape)} (id={base_id} "
+                        f"patch_y0={y0} patch_x0={x0})"
                     )
         if mask_patch is not None and "ignore_mask" in patch_meta:
             ignore_mask = patch_meta["ignore_mask"]
@@ -240,15 +243,21 @@ class PatchDataset(Dataset):
                 elif ignore_mask.ndim == 2:
                     ignore_hw = tuple(ignore_mask.shape)
                 else:
+                    base_id = meta.get("id", f"base_{pi.base_idx}")
                     raise ValueError(
-                        f"ignore_mask must have shape [1,H,W] or [H,W]; got {tuple(ignore_mask.shape)}"
+                        "ignore_mask must have shape [1,H,W] or [H,W]; "
+                        f"got {tuple(ignore_mask.shape)} (id={base_id} "
+                        f"patch_y0={y0} patch_x0={x0})"
                     )
             else:
                 ignore_hw = tuple(torch.as_tensor(ignore_mask).shape[-2:])
             mask_hw = tuple(mask_patch.shape[-2:])
             if ignore_hw != mask_hw:
+                base_id = meta.get("id", f"base_{pi.base_idx}")
                 raise ValueError(
-                    f"ignore_mask spatial shape mismatch: got {ignore_hw}, expected {mask_hw}"
+                    "ignore_mask spatial shape mismatch: "
+                    f"got {ignore_hw}, expected {mask_hw} (id={base_id} "
+                    f"patch_y0={y0} patch_x0={x0})"
                 )
 
         return img_patch, mask_patch, patch_meta
