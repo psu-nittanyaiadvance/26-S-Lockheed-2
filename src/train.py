@@ -15,7 +15,8 @@ from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
 from eval import evaluate
-from UNet import UNetModel
+from UNet.UNetModel import UNet as UNetModel
+from data_loader.sar_dataset import SARDataset
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
@@ -53,7 +54,8 @@ def train_model(
         gradient_clipping: float = 1.0,
         tv_alpha = 0.7, #confirm default for Tversky alpha
         tv_beta = 0.3, #confirm default for Tversky beta
-        adam_betas = (0.9, 0.999) 
+        adam_betas = (0.9, 0.999),
+        n_classes = 1
         ):
 
     #optimizer setup
@@ -137,7 +139,7 @@ def train_model(
                                     writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
 
                         # 2. Run Evaluation
-                        val_score = evaluate(model, val_loader, device, amp, criterion, )
+                        val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
 
                         logging.info(f'Validation Dice score: {val_score}')
 
@@ -184,6 +186,10 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--img-dir', type=str, required=True, help='Path to image .pt tensors')
+    parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .pt tensors')
+    parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
     return parser.parse_args()
 
@@ -194,7 +200,7 @@ if __name__ == '__main__':
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = UNetModel(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNetModel(n_channels=2, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -209,6 +215,50 @@ if __name__ == '__main__':
         logging.info(f'Model loaded from {args.load}')
 
     model.to(device=device)
+    seed = getattr(args, 'seed', 0)
+    torch.manual_seed(seed)
+    img_dir = Path(args.img_dir)
+    mask_dir = Path(args.mask_dir)
+    ids = []
+    for ext in ('*.pt', '*.tif', '*.tiff'):
+        ids.extend([p.stem for p in img_dir.glob(ext)])
+    ids = sorted(set(ids))
+    dataset = SARDataset(
+        img_root=img_dir,
+        mask_root=mask_dir,
+        ids_or_paths=ids,
+        mode='strong',
+        mask_id_suffix_map={'S1Hand': 'S1OtsuLabelHand'},
+        expected_img_bands=2,
+    )
+    dataset.mask_values = [0, 1]
+    val_percent = args.val / 100
+    n_val = int(len(dataset) * val_percent)
+    n_train = len(dataset) - n_val
+    generator = torch.Generator().manual_seed(seed)
+    train_set, val_set = random_split(dataset, [n_train, n_val], generator=generator)
+
+    def _dict_collate(batch):
+        images = torch.stack([b[0] for b in batch], dim=0)
+        masks = torch.stack([b[1] for b in batch], dim=0)
+        return {'image': images, 'mask': masks}
+
+    num_workers = getattr(args, 'num_workers', 0)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=_dict_collate
+    )
+    val_loader = DataLoader(
+        val_set,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=_dict_collate
+    )
+    dir_checkpoint = Path('checkpoints')
     try:
         train_model(
             model=model,
@@ -218,7 +268,8 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            n_classes=args.classes
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -234,5 +285,6 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            n_classes=args.classes
         )
