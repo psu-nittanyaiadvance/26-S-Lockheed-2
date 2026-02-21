@@ -11,32 +11,33 @@ import torchvision.transforms.functional as TF
 from pathlib import Path
 from torch import optim
 from torch.utils.data import DataLoader, random_split
+from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-import wandb
-from evaluate import evaluate
+from eval import evaluate
 from UNet import UNetModel
-from utils.data_loading import BasicDataset, CarvanaDataset
-from utils.dice_score import dice_loss
-
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
-    # Apply sigmoid/softmax to get probabilities
+    # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
     
-    # Flatten label and prediction tensors
-    inputs = inputs.view(-1)
-    targets = targets.view(-1)
+    # 2. Flatten ONLY the spatial dimensions (Height x Width)
+    # This preserves the Batch (dim 0) and Class (dim 1) boundaries
+    # Shape changes from [Batch, Classes, Height, Width] -> [Batch, Classes, Pixels]
+    inputs = inputs.view(inputs.shape[0], inputs.shape[1], -1)
+    targets = targets.view(targets.shape[0], targets.shape[1], -1)
     
-    # True Positives, False Positives, False Negatives
-    TP = (inputs * targets).sum()    
-    FP = ((1 - targets) * inputs).sum()
-    FN = (targets * (1 - inputs)).sum()
+    # 3. Calculate True Positives, False Positives, and False Negatives
+    # We sum across dim=2 (the flattened pixels) to get totals PER CLASS
+    TP = (inputs * targets).sum(dim=2)    
+    FP = ((1 - targets) * inputs).sum(dim=2)
+    FN = (targets * (1 - inputs)).sum(dim=2)
     
+    # 4. Calculate the Tversky index (Yields a score for each class, per image)
     tversky_index = (TP + epsilon) / (TP + alpha * FP + beta * FN + epsilon)
-    return 1 - tversky_index
-
-
+    
+    # 5. Average the scores across all classes and batches, then subtract from 1
+    return 1 - tversky_index.mean()
 
 def train_model(
         model,
@@ -49,13 +50,11 @@ def train_model(
         img_scale: float = 0.5,
         amp: bool = False,
         weight_decay: float = 1e-8,
-        momentum: float = 0.999,
         gradient_clipping: float = 1.0,
         tv_alpha = 0.7, #confirm default for Tversky alpha
         tv_beta = 0.3, #confirm default for Tversky beta
         adam_betas = (0.9, 0.999) 
         ):
-
 
     #optimizer setup
     optimizer = optim.Adam(
@@ -64,6 +63,10 @@ def train_model(
     betas=adam_betas, 
     weight_decay=weight_decay
     )
+
+    writer = SummaryWriter(comment=f'LR_{learning_rate}_BS_{batch_size}')
+    logging.info(f"Hyperparameters: {locals()}")
+
     #define loss function with Tversky
     criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
 
@@ -116,7 +119,52 @@ def train_model(
                 progress_bar.update(images.shape[0])
                 global_step += 1
                 epoch_loss += loss.item()
+                writer.add_scalar('Loss/train', loss.item(), global_step)
+                writer.add_scalar('Epoch', epoch, global_step)
                 progress_bar.set_postfix(**{'loss (batch)': loss.item()})
+
+                # --- Evaluation round (Local Logging Version) ---
+                division_step = (n_train // (5 * batch_size))
+                if division_step > 0:
+                    if global_step % division_step == 0:
+                        # 1. Log Weights and Gradients Histograms
+                        for tag, value in model.named_parameters():
+                            tag = tag.replace('/', '.')
+                            if not (torch.isinf(value) | torch.isnan(value)).any():
+                                writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
+                            if value.grad is not None:
+                                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                    writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
+
+                        # 2. Run Evaluation
+                        val_score = evaluate(model, val_loader, device, amp, criterion, )
+
+                        logging.info(f'Validation Dice score: {val_score}')
+
+                        # 3. Log Scalars and Images to TensorBoard
+                        try:
+                            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                            writer.add_scalar('Validation/Dice', val_score, global_step)
+                            
+                            # Log the first image in the batch
+                            # Note: TensorBoard expects (C, H, W)
+                            writer.add_image('Visuals/Image', images[0].cpu(), global_step)
+                            
+                            # Ground Truth Mask (adding channel dim)
+                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
+                            
+                            # Predicted Mask (taking argmax and adding channel dim)
+                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
+                            writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
+                        except Exception as e:
+                            logging.warning(f"Could not log to TensorBoard: {e}")
+        
+        if save_checkpoint:
+            Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+            state_dict = model.state_dict()
+            state_dict['mask_values'] = dataset.mask_values
+            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+            logging.info(f'Checkpoint {epoch} saved!')
 
 
 # This argparse block defines command-line options so you can run training with different
@@ -188,5 +236,3 @@ if __name__ == '__main__':
             val_percent=args.val / 100,
             amp=args.amp
         )
-
-
