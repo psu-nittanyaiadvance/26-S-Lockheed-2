@@ -14,12 +14,13 @@ def default_collate(
     if not batch:
         raise ValueError("Empty batch")
 
+    #stack images and masks, keep metadata as a list
     images = torch.stack([b[0] for b in batch], dim=0)
     masks = [b[1] for b in batch]
 
     if all(m is None for m in masks):
         mask_batch = None
-    elif any(m is None for m in masks):
+    elif any(m is None for m in masks): #checking for mixed labeled and unlabeled samples in the same batch
         raise ValueError("Mixed labeled and unlabeled samples in the same batch")
     else:
         mask_batch = torch.stack([m for m in masks], dim=0)

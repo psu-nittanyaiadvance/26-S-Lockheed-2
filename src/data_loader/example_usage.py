@@ -15,10 +15,10 @@ from __future__ import annotations
 from pathlib import Path
 from torch.utils.data import DataLoader
 
-from dataloader.sar_dataset import SARDataset
-from dataloader.splits import make_split
-from dataloader.collate import default_collate
-from dataloader.stats import compute_running_mean_std
+from data_loader.sar_dataset import SARDataset
+from data_loader.splits import make_split
+from data_loader.collate import default_collate
+from data_loader.stats import compute_running_mean_std
 
 
 def main() -> None:
