@@ -1,29 +1,25 @@
+import argparse
+import logging
+import os
+import random
+import sys
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import torchvision.transforms as transforms
+import torchvision.transforms.functional as TF
+from pathlib import Path
+from torch import optim
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-#main function
-if __name__ == "__main__":
-    pass
+import wandb
+from evaluate import evaluate
+from unet import UNet
+from utils.data_loading import BasicDataset, CarvanaDataset
+from utils.dice_score import dice_loss
 
 
-"""
-train_model() paramaters for adam optimizer and tversky loss
-adam_betas: tuple = (0.9, 0.999),
-tversky_alpha: float = 0.5,  # Controls penalty for False Positives
-tversky_beta: float = 0.5,   # Controls penalty for False Negatives
-gradient_clipping: float = 1.0,
-"""
-
-"""
-optimizer set up
-
-optimizer = optim.Adam(
-    model.parameters(), 
-    lr=learning_rate, 
-    betas=adam_betas, 
-    weight_decay=weight_decay
-)
-"""
-
-"""
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # Apply sigmoid/softmax to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
@@ -40,24 +36,89 @@ def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     tversky_index = (TP + epsilon) / (TP + alpha * FP + beta * FN + epsilon)
     return 1 - tversky_index
 
-"""
 
 
-"""
-# Inside the training loop batch processing:
-with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
-    masks_pred = model(images)
-    
-    # Replace old loss calculation with Tversky
-    loss = tversky_loss(
-        masks_pred, 
-        true_masks.float(), 
-        alpha=tversky_alpha, 
-        beta=tversky_beta
+def train_model(
+        model,
+        device,
+        epochs: int = 5,
+        batch_size: int = 1,
+        learning_rate: float = 1e-5,
+        val_percent: float = 0.1,
+        save_checkpoint: bool = True,
+        img_scale: float = 0.5,
+        amp: bool = False,
+        weight_decay: float = 1e-8,
+        momentum: float = 0.999,
+        gradient_clipping: float = 1.0,
+        tv_alpha = 0.7, #confirm default for Tversky alpha
+        tv_beta = 0.3, #confirm default for Tversky beta
+        adam_betas = (0.9, 0.999) 
+        ):
+
+
+    #optimizer setup
+    optimizer = optim.Adam(
+    model.parameters(), 
+    lr=learning_rate, 
+    betas=adam_betas, 
+    weight_decay=weight_decay
     )
-"""
+    #define loss function with Tversky
+    criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
 
-"""
+    grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
+    global_step = 0
+
+    for epoch in range(1, epochs + 1):
+        #model into training mode
+        model.train()
+        epoch_loss = 0
+
+        #create progress bar as a 
+        with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as progress_bar:
+            for batch in train_loader:
+                images, true_masks = batch['image'], batch['mask']
+
+                #check for correct dimensionality
+                assert images.shape[1] == model.n_channels, \
+                    f'Network has been defined with {model.n_channels} input channels, ' \
+                    f'but loaded images have {images.shape[1]} channels. Please check that ' \
+                    'the images are loaded correctly.'
+
+                #format and load to device
+                images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
+                true_masks = true_masks.to(device=device, dtype=torch.long)
+
+                #forward pass
+                with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
+                    masks_pred = model(images)
+                    
+                    if model.n_classes == 1:
+                        # Add a channel dimension to true_masks so it matches masks_pred shape [Batch, 1, Height, Width]
+                        target_masks = true_masks.unsqueeze(1).float()
+                        loss = criterion(masks_pred, target_masks)
+                    else:
+                        # One-hot encode the target masks and rearrange dimensions to match masks_pred
+                        target_masks = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
+                        loss = criterion(masks_pred, target_masks)
+                        
+                #clear previous gradients
+                optimizer.zero_grad(set_to_none=True)
+                #scale gradient to avoid 0 rounded grad values
+                grad_scaler.scale(loss).backward()
+                grad_scaler.unscale_(optimizer)
+                #clip gradient values to maximum
+                torch.nn.utils.clip_grad_norm_(model.parameters(), gradient_clipping)
+                grad_scaler.step(optimizer)
+                grad_scaler.update()
+
+                progress_bar.update(images.shape[0])
+                global_step += 1
+                epoch_loss += loss.item()
+                progress_bar.set_postfix(**{'loss (batch)': loss.item()})
+
+
 # This argparse block defines command-line options so you can run training with different
 # settings (epochs, batch size, LR, scaling, AMP, etc.) without editing the source code.
 import argparse
@@ -77,25 +138,14 @@ def get_args():
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
 
     return parser.parse_args()
-"""
 
-"""
-argparse usage in main
+
+
+#argparse usage in main
 
 if __name__ == '__main__':
     args = get_args()
 
-    # examples from args:
-    # args.epochs
-    # args.batch_size
-    # args.lr
-    # args.load
-    # args.scale
-    # args.val
-    # args.amp
-    # args.bilinear
-    # args.classes
-"""
 
 
 
