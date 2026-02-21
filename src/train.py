@@ -13,9 +13,10 @@ from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
-
 from eval import evaluate
 from UNet import UNetModel
+
+dir_checkpoint = Path('./checkpoints/')
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
@@ -70,6 +71,8 @@ def train_model(
     #define loss function with Tversky
     criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
 
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
 
@@ -123,42 +126,58 @@ def train_model(
                 writer.add_scalar('Epoch', epoch, global_step)
                 progress_bar.set_postfix(**{'loss (batch)': loss.item()})
 
-                # --- Evaluation round (Local Logging Version) ---
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
-                    if global_step % division_step == 0:
-                        # 1. Log Weights and Gradients Histograms
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
-                            if value.grad is not None:
-                                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                    writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
+                # --- Evaluation round (Local Logging & Scheduler Integration) ---
+                division_step = max(1, n_train // (5 * batch_size))
+                if division_step > 0 and global_step % division_step == 0:
+                    
+                    # 1. Weights and Gradients Health Check
+                    for tag, value in model.named_parameters():
+                        tag = tag.replace('/', '.')
+                        if not (torch.isinf(value) | torch.isnan(value)).any():
+                            writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
+                        if value.grad is not None:
+                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
 
-                        # 2. Run Evaluation
-                        val_score = evaluate(model, val_loader, device, amp, criterion, )
+                    # 2. Run Evaluation (Now returns a dictionary of metrics)
+                    # Note: pass model.n_classes so the function knows how to calculate IoU
+                    val_metrics = evaluate(model, val_loader, device, amp, criterion, model.n_classes)
 
-                        logging.info(f'Validation Dice score: {val_score}')
+                    # 3. Update the Scheduler
+                    # We use val_mIoU because it's the most stable indicator of model quality
+                    scheduler.step(val_metrics['val_mIoU'])
 
-                        # 3. Log Scalars and Images to TensorBoard
-                        try:
-                            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
-                            writer.add_scalar('Validation/Dice', val_score, global_step)
-                            
-                            # Log the first image in the batch
-                            # Note: TensorBoard expects (C, H, W)
-                            writer.add_image('Visuals/Image', images[0].cpu(), global_step)
-                            
-                            # Ground Truth Mask (adding channel dim)
-                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
-                            
-                            # Predicted Mask (taking argmax and adding channel dim)
-                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
-                            writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
-                        except Exception as e:
-                            logging.warning(f"Could not log to TensorBoard: {e}")
-        
+                    # Get the current LR (in case the scheduler just dropped it)
+                    current_lr = optimizer.param_groups[0]['lr']
+
+                    logging.info(f'Step {global_step}: mIoU = {val_metrics["val_mIoU"]:.4f}, LR = {current_lr}')
+
+                    # 4. Log Metrics and Visuals to TensorBoard
+                    try:
+                        # Log all scalar metrics from the dictionary
+                        for metric_name, value in val_metrics.items():
+                            writer.add_scalar(f'Metrics/{metric_name}', value, global_step)
+                        
+                        # Log the current learning rate
+                        writer.add_scalar('Settings/Learning_Rate', current_lr, global_step)
+                        
+                        # Visual Comparison (Log the first image of the current batch)
+                        writer.add_image('Visuals/Image', images[0].cpu(), global_step)
+                        writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
+                        
+                        # Handle prediction visualization based on class count
+                        if model.n_classes == 1:
+                            # Binary: use sigmoid + threshold
+                            p_mask = (torch.sigmoid(masks_pred[0]) > 0.5).float().cpu()
+                        else:
+                            # Multiclass: take the highest probability class
+                            p_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
+                        
+                        writer.add_image('Visuals/Mask_Pred', p_mask, global_step)
+
+                    except Exception as e:
+                        logging.warning(f"Could not log to TensorBoard: {e}")
+
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
@@ -177,7 +196,7 @@ def get_args():
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
-    parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
+    parser.add_argument('--load', '-f', type=str, default=None, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
@@ -191,6 +210,8 @@ def get_args():
 
 #argparse usage in main
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
