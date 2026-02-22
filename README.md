@@ -48,7 +48,7 @@ py -m pip install -r requirements.txt
 
 ```powershell
 python src/train.py --img-dir "datasets/FilteredSouthAsia/HandLabeled/S1Hand" `
-  --mask-dir "datasets/FilteredSouthAsia/HandLabeled/LabelHand" `
+  --mask-dir "datasets\FilteredSouthAsia\HandLabeled\S1OtsuLabelHand" `
   --epochs 20 --batch-size 8 --learning-rate 1e-4 --validation 10 --classes 1
 ```
 
