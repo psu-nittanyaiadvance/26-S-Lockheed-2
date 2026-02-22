@@ -1,21 +1,14 @@
-# SAR Flood Segmentation
+# SAR Flood Segmentation (Baseline)
 
-This repo focuses on data loading, time-matched SAR+Optical preparation, and
-dataset guardrails for flood segmentation experiments. The U-Net and training
-loop are owned by other teammates.
+This repo is a minimal SAR-only baseline for flood segmentation using the
+Sen1Floods11 subset filtered to the Indian subcontinent. All masks are
+ground-truth (strong or weak labels only). Training uses 256x256 patches with
+20% overlap via `PatchDataset`.
 
 **Repo Structure**
 
-```text
+```
 .
-├── configs/
-│   └── gee_time_match.yaml
-├── data/
-│   └── derived/
-│       ├── sen1floods11_time_manifest.csv
-│       ├── gee_time_matched/
-│       │   └── <split>/<sample_id>.tif
-│       └── gee_time_matched_manifest.csv
 ├── datasets/
 │   └── FilteredSouthAsia/
 │       ├── WeaklyLabeled/
@@ -24,23 +17,15 @@ loop are owned by other teammates.
 │       └── HandLabeled/
 │           ├── S1Hand/
 │           └── LabelHand/
-├── docs/
-│   ├── ABLATIONS.md
-│   ├── DATA.md
-│   ├── DATALOADER.md
-│   └── TIME_MATCHING.md
 ├── scripts/
-│   ├── gee_download_time_matched.py
-│   ├── smoke_test_time_matched.py
-│   └── smoke_test_loader.py
+│   ├── export_patches.py
+│   └── forward_pass_augmented.py
 └── src/
-    └── data_loader/
-        ├── sar_dataset.py
-        ├── collate.py
-        ├── splits.py
-        ├── stats.py
-        ├── discover_ids.py
-        └── validate_dataset.py
+    ├── data_loader/
+    │   ├── sar_dataset.py
+    │   ├── patch_dataset.py
+    │   └── README.md
+    └── train.py
 ```
 
 **Quickstart (PowerShell)**
@@ -59,46 +44,14 @@ py -m pip install --upgrade pip
 py -m pip install -r requirements.txt
 ```
 
-3. (Optional) Download time-matched stacks from GEE:
+3. Train (patching is automatic in `src/train.py`):
 
 ```powershell
-python scripts/gee_download_time_matched.py --config configs/gee_time_match.yaml
-```
-
-4. Smoke test the loader:
-
-```powershell
-python scripts/smoke_test_loader.py
-```
-
-5. Compute normalization stats (example):
-
-```powershell
-@'
-from src.data_loader.sar_dataset import SARDataset
-from src.data_loader.stats import compute_running_mean_std
-
-ds = SARDataset(
-    img_root="datasets/FilteredSouthAsia/WeaklyLabeled/S1Weak",
-    mask_root="datasets/FilteredSouthAsia/WeaklyLabeled/S1OtsuLabelWeak",
-    ids_or_paths=["<sample_id_1>", "<sample_id_2>"],
-    mode="weak",
-    normalize_cfg="none",
-    transforms=None,
-)
-
-mean, std = compute_running_mean_std(ds, max_samples=512)
-print(mean)
-print(std)
-'@ | python -
+python src/train.py --img-dir "datasets/FilteredSouthAsia/HandLabeled/S1Hand" `
+  --mask-dir "datasets/FilteredSouthAsia/HandLabeled/LabelHand" `
+  --epochs 20 --batch-size 8 --learning-rate 1e-4 --validation 10 --classes 1
 ```
 
 **Data Loader**
 
-Detailed dataloader documentation lives in `src/data_loader/README.md`.
-
-**Docs**
-- `docs/DATA.md`: dataset layout, manifests, ID conventions
-- `docs/DATALOADER.md`: SARDataset, collate, splits, stats, validation
-- `docs/TIME_MATCHING.md`: GEE downloader, band order, manifest checks
-- `docs/ABLATIONS.md`: ablation grid and no-confound rules
+See `src/data_loader/README.md` for dataset usage and patching details.

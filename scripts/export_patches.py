@@ -47,7 +47,7 @@ def get_args() -> argparse.Namespace:
         "--mode",
         type=str,
         default="weak",
-        choices=["weak", "strong", "none"],
+        choices=["weak", "strong"],
         help="Label mode for the dataset.",
     )
     parser.add_argument(
@@ -195,28 +195,19 @@ def main() -> None:
     out_dir = args.out_dir
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    if args.mode == "none":
-        ids = list_ids_from_dir(args.img_root)
-        report = {
-            "images_total": len(ids),
-            "paired_total": len(ids),
-            "mode": "none",
-        }
-        suffix_map = {}
-    else:
-        image_ids = list_ids_from_dir(args.img_root)
-        ids = []
-        for sample_id in image_ids:
-            mask_id = apply_suffix_map(sample_id, suffix_map)
-            mask_path = resolve_raster_path(args.mask_root, mask_id)
-            if mask_path.exists():
-                ids.append(sample_id)
-        report = {
-            "images_total": len(image_ids),
-            "paired_total": len(ids),
-            "missing_in_masks": len(image_ids) - len(ids),
-            "suffix_map": suffix_map,
-        }
+    image_ids = list_ids_from_dir(args.img_root)
+    ids = []
+    for sample_id in image_ids:
+        mask_id = apply_suffix_map(sample_id, suffix_map)
+        mask_path = resolve_raster_path(args.mask_root, mask_id)
+        if mask_path.exists():
+            ids.append(sample_id)
+    report = {
+        "images_total": len(image_ids),
+        "paired_total": len(ids),
+        "missing_in_masks": len(image_ids) - len(ids),
+        "suffix_map": suffix_map,
+    }
 
     if not ids:
         raise RuntimeError("No IDs found for the requested roots/mode.")
@@ -235,7 +226,7 @@ def main() -> None:
     else:
         raw_ds = SARDataset(
             img_root=args.img_root,
-            mask_root=args.mask_root if args.mode != "none" else None,
+            mask_root=args.mask_root,
             ids_or_paths=ids,
             mode=args.mode,
             normalize_cfg="none",
@@ -257,7 +248,7 @@ def main() -> None:
 
     norm_ds = SARDataset(
         img_root=args.img_root,
-        mask_root=args.mask_root if args.mode != "none" else None,
+        mask_root=args.mask_root,
         ids_or_paths=ids,
         mode=args.mode,
         normalize_cfg={"type": "zscore", "mean": mean, "std": std},

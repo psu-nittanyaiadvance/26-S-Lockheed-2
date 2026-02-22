@@ -9,7 +9,5 @@ rasterio
 matplotlib
 pandas
 
-# GEE pipeline
-earthengine-api
-google-auth
+# Utilities
 tqdm

@@ -2,7 +2,7 @@
 README-style quickstart:
 
 1) Set IMG_ROOT, WEAK_MASK_ROOT, STRONG_MASK_ROOT to your dataset folders.
-2) Provide IDs like "tile_000123" or a list of image paths.
+2) Provide IDs like "tile_000123" (or pass paths with ids_are_paths=True).
 3) Run this script to verify the loader and batch shapes.
 
 Example IDs:
@@ -82,24 +82,6 @@ def main() -> None:
         strong_train,
         batch_size=4,
         shuffle=True,
-        num_workers=0,
-        collate_fn=default_collate,
-    )
-
-    infer_ds = SARDataset(
-        img_root=img_root,
-        mask_root=None,
-        ids_or_paths=val_ids,
-        mode="none",
-        normalize_cfg="none",
-        log_transform=True,
-        validate=False,
-    )
-
-    infer_loader = DataLoader(
-        infer_ds,
-        batch_size=4,
-        shuffle=False,
         num_workers=0,
         collate_fn=default_collate,
     )

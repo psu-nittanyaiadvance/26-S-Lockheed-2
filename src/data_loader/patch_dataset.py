@@ -40,7 +40,7 @@ Design notes
 * The final column / row of patches is *right-/bottom-aligned* so the full
   image area is always covered even when width/height is not divisible by the
   stride.
-* Works with mode="none" (no mask) and mode="weak" / "strong" (binary mask).
+* Works with mode="weak" / "strong" (binary mask).
 * The metadata dict is forwarded from the base dataset and extended with
   patch-specific keys: patch_row, patch_col, patch_x0, patch_y0.
 """

@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
-from data_loader.sar_dataset import SARDataset
+from data_loader import PatchDataset, SARDataset
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
@@ -127,7 +127,7 @@ def train_model(
 
                 # --- Evaluation round (Local Logging Version) ---
                 division_step = (n_train // (5 * batch_size))
-                if division_step > 0:
+                if division_step > 0 and val_loader is not None:
                     if global_step % division_step == 0:
                         # 1. Log Weights and Gradients Histograms
                         for tag, value in model.named_parameters():
@@ -186,8 +186,8 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
-    parser.add_argument('--img-dir', type=str, required=True, help='Path to image .pt tensors')
-    parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .pt tensors')
+    parser.add_argument('--img-dir', type=str, required=True, help='Path to SAR image .tif/.tiff files')
+    parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .tif/.tiff files')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
@@ -220,10 +220,10 @@ if __name__ == '__main__':
     img_dir = Path(args.img_dir)
     mask_dir = Path(args.mask_dir)
     ids = []
-    for ext in ('*.pt', '*.tif', '*.tiff'):
+    for ext in ('*.tif', '*.tiff'):
         ids.extend([p.stem for p in img_dir.glob(ext)])
     ids = sorted(set(ids))
-    dataset = SARDataset(
+    base_dataset = SARDataset(
         img_root=img_dir,
         mask_root=mask_dir,
         ids_or_paths=ids,
@@ -231,12 +231,16 @@ if __name__ == '__main__':
         mask_id_suffix_map={'S1Hand': 'S1OtsuLabelHand'},
         expected_img_bands=2,
     )
-    dataset.mask_values = [0, 1]
+    base_dataset.mask_values = [0, 1]
     val_percent = args.val / 100
-    n_val = int(len(dataset) * val_percent)
-    n_train = len(dataset) - n_val
+    n_val = int(len(base_dataset) * val_percent)
+    n_train = len(base_dataset) - n_val
     generator = torch.Generator().manual_seed(seed)
-    train_set, val_set = random_split(dataset, [n_train, n_val], generator=generator)
+    train_base, val_base = random_split(base_dataset, [n_train, n_val], generator=generator)
+    train_set = PatchDataset(train_base, patch_size=256, overlap=0.2)
+    val_set = PatchDataset(val_base, patch_size=256, overlap=0.2) if n_val > 0 else None
+    dataset = base_dataset
+    n_train = len(train_set)
 
     def _dict_collate(batch):
         images = torch.stack([b[0] for b in batch], dim=0)
@@ -251,13 +255,15 @@ if __name__ == '__main__':
         num_workers=num_workers,
         collate_fn=_dict_collate
     )
-    val_loader = DataLoader(
-        val_set,
-        batch_size=args.batch_size,
-        shuffle=False,
-        num_workers=num_workers,
-        collate_fn=_dict_collate
-    )
+    val_loader = None
+    if val_set is not None:
+        val_loader = DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=_dict_collate
+        )
     dir_checkpoint = Path('checkpoints')
     try:
         train_model(

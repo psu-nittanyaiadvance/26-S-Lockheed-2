@@ -1,103 +1,34 @@
 # Data Loader (src/data_loader)
 
-This repo's core functionality lives in `src/data_loader`. The loader is built for
-Sentinel-1 SAR tiles with optional masks and optional time-matched SAR+Optical
-stacks. It is intentionally strict about shapes and dtypes so downstream models
-see consistent tensors.
+This folder contains the SAR-only dataset and utilities used by the baseline.
+All samples are ground-truth masks (strong or weak labels).
 
 **Core Dataset: `SARDataset`**
 
-`SARDataset` returns a 3-tuple: `(image, mask, metadata)`.
+`SARDataset` returns `(image, mask, metadata)`:
 - `image`: `torch.float32` with shape `[C, H, W]` read via rasterio.
-- `mask`: `torch.uint8` with shape `[1, H, W]`, or `None` when `mode="none"`.
-- `metadata`: dict with `id`, `img_path`, `mask_path`, plus time-matched fields
-  when enabled.
+- `mask`: `torch.uint8` with shape `[1, H, W]` (binary).
+- `metadata`: dict with `id`, `img_path`, `mask_path`, and `ignore_mask`.
 
-`mode` controls label behavior:
-- `mode="weak"`: masks are read from `mask_root` (weak labels).
-- `mode="strong"`: masks are read from `mask_root` (hand labels).
-- `mode="none"`: no masks returned; `mask_root` is not required.
+Notes:
+- `mode` must be `strong` or `weak` (masks are always required).
+- If `ids_are_paths=False`, pass stems in `ids_or_paths` and set `img_root`.
+- If `ids_are_paths=True`, pass `.tif/.tiff` paths and set `mask_root`.
+- `mask_id_suffix_map` can map image IDs to mask IDs when filenames differ.
+- `normalize_cfg` supports `"none"` or `{"type": "zscore", "mean": ..., "std": ...}`.
 
-ID/path resolution:
-- `ids_or_paths` can be IDs like `tile_000123` or explicit `.tif/.tiff` paths.
-- `ids_are_paths` is inferred if any item is absolute, has a tif suffix, or
-  contains a path separator.
-- For ID inputs, images are resolved to `img_root/<id>.tif` (fallback to `.tiff`).
-- For path inputs, images use the given path and masks use `mask_root/<stem>.tif`.
-- The dataset does not map weak<->strong IDs; it only uses the provided list.
+**Patching**
 
-Image and mask loading:
-- Images are read as `[C,H,W]`, cast to `float32`, and optionally log-transformed
-  (`log_transform=True` uses `log1p(abs(x))`).
-- Masks are read from band 1, validated for shape match, and binarized
-  (`mask > 0`) into `[1,H,W]` with `uint8` dtype.
+Use `PatchDataset` (or `SARDataset.with_patches`) to generate overlapping
+256×256 patches with 20% overlap (stride computed in `PatchDataset`).
 
-Normalization:
-- `normalize_cfg=None` or `"none"`: no normalization.
-- `normalize_cfg={"type": "zscore", "mean": ..., "std": ...}`: per-band z-score
-  with strict checks for channel count and positive std values.
-- For raw stats computation, create the dataset with `normalize_cfg="none"` and
-  `transforms=None`.
+**Utilities**
 
-Validation and filtering:
-- `validate=True` validates each sample at init, dropping unreadable rasters or
-  mismatched mask sizes with a warning. If all samples fail, it raises.
-- Errors during `__getitem__` are explicit (e.g., missing masks in labeled mode).
-
-Transforms:
-- `transforms` is called as `transforms(image, mask, metadata)`.
-- It must return `(image, mask, metadata)` or `(image, mask)`; other outputs
-  raise a `ValueError`.
-
-**Time-Matched SAR+Optical Stacks**
-
-Enable time-matched stacks with `use_time_matched=True`. This augments
-`metadata` with:
-- `time_matched`: `torch.float32` stack of shape `[8,H,W]` (VV, VH + 6 S2 bands).
-- `time_matched_path`: resolved path or `None`.
-- `time_matched_status`: status string from the manifest or a fallback value.
-
-Path resolution and status handling:
-- The loader reads `time_matched_manifest` (CSV) when present and indexes by
-  `sample_id`. If a row has `status="ok"` and a valid `path`, it uses that path.
-- Otherwise it falls back to `time_matched_root/<split>/<id>.tif`, where `split`
-  is inferred from the image path (`WeaklyLabeled`, `HandLabeled`, else `all`).
-- Manifest statuses like `missing_s1`, `missing_s2`, `missing_both`, or `error`
-  are treated as missing for loading.
-
-Missing policy (`time_matched_missing_policy`):
-- `zeros`: return an all-zero `[8,H,W]` stack (warning emitted once).
-- `skip`: drop samples without a valid time-matched stack at init time.
-- `raise`: raise at `__getitem__` when a stack is missing.
-
-**Batching (`default_collate`)**
-
-`default_collate` stacks images into `[B,C,H,W]` and masks into `[B,1,H,W]`.
-It preserves metadata as a list and raises if a batch mixes labeled and
-unlabeled samples.
-
-**Dataset Utilities**
-
-ID discovery and pairing (`discover_ids.py`):
 - `list_ids_from_dir(img_root)`: sorted stems for `.tif/.tiff` files.
-- `paired_ids(img_root, mask_root)`: intersection of image/mask IDs plus a
-  missing-count report.
-
-Deterministic splits (`splits.py`):
-- `make_split(ids, val_frac, seed)` sorts IDs, applies a seeded shuffle, and
-  ensures at least one validation sample when `val_frac > 0`.
-
-Normalization stats (`stats.py`):
-- `compute_running_mean_std(dataset, max_samples=None)` uses Welford's
-  algorithm for streaming per-band mean/std on `[C,H,W]` images.
-
-Validation helpers (`validate_dataset.py`):
-- `validate_sample_shapes(ds, n=64)` checks image/mask shapes, dtypes, and
-  finite values.
-- `validate_time_matched(ds, n=64)` checks time-matched stacks and missing-policy
-  behavior.
-- `validate_manifest_consistency(path)` validates required manifest columns and
-  allowed status values.
+- `paired_ids(img_root, mask_root)`: intersection of image/mask IDs.
+- `make_split(ids, val_frac, seed)`: deterministic split helper.
+- `compute_running_mean_std(dataset, max_samples=None)`: streaming stats.
+- `validate_sample_shapes(ds, n=64)`: checks image/mask shapes and dtypes.
 
 **Usage Example**
 
@@ -106,41 +37,43 @@ from pathlib import Path
 from torch.utils.data import DataLoader
 
 from src.data_loader import (
+    PatchDataset,
     SARDataset,
     compute_running_mean_std,
     default_collate,
     make_split,
 )
 
-img_root = Path("datasets/FilteredSouthAsia/WeaklyLabeled/S1Weak")
-weak_mask_root = Path("datasets/FilteredSouthAsia/WeaklyLabeled/S1OtsuLabelWeak")
+img_root = Path("datasets/FilteredSouthAsia/HandLabeled/S1Hand")
+mask_root = Path("datasets/FilteredSouthAsia/HandLabeled/LabelHand")
 
 ids = ["tile_000123", "tile_000124", "tile_000125", "tile_000126"]
 train_ids, val_ids = make_split(ids, val_frac=0.2, seed=1337)
 
 train_raw = SARDataset(
     img_root=img_root,
-    mask_root=weak_mask_root,
+    mask_root=mask_root,
     ids_or_paths=train_ids,
-    mode="weak",
+    mode="strong",
     normalize_cfg="none",
     log_transform=True,
-    validate=True,
 )
 
 mean, std = compute_running_mean_std(train_raw, max_samples=512)
 
 train_ds = SARDataset(
     img_root=img_root,
-    mask_root=weak_mask_root,
+    mask_root=mask_root,
     ids_or_paths=train_ids,
-    mode="weak",
+    mode="strong",
     normalize_cfg={"type": "zscore", "mean": mean, "std": std},
     log_transform=True,
 )
 
+patch_ds = PatchDataset(train_ds, patch_size=256, overlap=0.2)
+
 train_loader = DataLoader(
-    train_ds,
+    patch_ds,
     batch_size=4,
     shuffle=True,
     num_workers=0,
