@@ -266,6 +266,7 @@ class SARDataset(Dataset):
         img = self._apply_normalization(img)
         if not np.isfinite(img).all():
             img = np.nan_to_num(img, nan=0.0, posinf=0.0, neginf=0.0)
+            
         return img
 
     def _load_mask(
