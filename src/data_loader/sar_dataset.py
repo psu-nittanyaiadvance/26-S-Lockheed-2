@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
 
 import numpy as np
+from numpy.strings import lower
 import torch
 from torch.utils.data import Dataset
 import rasterio
@@ -371,6 +372,18 @@ class SARDataset(Dataset):
                 f"got shape {img.shape}"
             )
         img = img.astype(np.float32, copy=False)
+
+        # --- Percentile Backscatter Clipping (2–98 dB) ---
+        img_t = torch.from_numpy(img)
+
+        flat = img_t.view(img_t.shape[0], -1)
+
+        lower = torch.nanquantile(flat, 0.02, dim=1, keepdim=True).view(-1, 1, 1)
+        upper = torch.nanquantile(flat, 0.98, dim=1, keepdim=True).view(-1, 1, 1)
+
+        img_t = torch.clamp(img_t, lower, upper)
+
+        img = img_t.numpy()            
 
         # --- Step 1: flag pixels already invalid after load ---
         invalid = ~np.isfinite(img)  # (C, H, W)
