@@ -96,6 +96,9 @@ class SARDataset(Dataset):
         time_matched_root: Union[str, Path] = "data/derived/gee_time_matched",
         time_matched_manifest: Union[str, Path] = "data/derived/gee_time_matched_manifest.csv",
         time_matched_missing_policy: str = "zeros",
+        mask_id_suffix_map: Optional[Dict[str, str]] = None,
+        expected_img_bands: Optional[int] = None,
+        
     ) -> None:
         if mode not in {"weak", "strong", "none"}:
             raise ValueError(f"mode must be one of 'weak', 'strong', 'none'; got {mode}")
@@ -113,6 +116,10 @@ class SARDataset(Dataset):
 
         self.img_root = Path(img_root) if img_root is not None else None
         self.mask_root = Path(mask_root) if mask_root is not None else None
+        self.mask_id_suffix_map = dict(mask_id_suffix_map) if mask_id_suffix_map else None
+        self.expected_img_bands = expected_img_bands
+        if self.expected_img_bands is not None and self.expected_img_bands <= 0:
+            raise ValueError("expected_img_bands must be a positive integer")
 
         if not self.ids_are_paths:
             if self.img_root is None:
@@ -221,6 +228,14 @@ class SARDataset(Dataset):
             return tiff
         return tif
 
+    def _resolve_mask_id(self, sample_id: str) -> str:
+        if not self.mask_id_suffix_map:
+            return sample_id
+        for img_suffix, mask_suffix in self.mask_id_suffix_map.items():
+            if sample_id.endswith(img_suffix):
+                return f"{sample_id[:-len(img_suffix)]}{mask_suffix}"
+        return sample_id
+
     def _build_samples(self, ids_or_paths: Sequence[Union[str, Path]]) -> List[Sample]:
         samples: List[Sample] = []
         for item in ids_or_paths:
@@ -238,7 +253,8 @@ class SARDataset(Dataset):
             if self.mode != "none":
                 if self.mask_root is None:
                     raise ValueError("mask_root is required for labeled modes")
-                mask_path = self._resolve_raster_path(self.mask_root, sample_id)
+                mask_id = self._resolve_mask_id(sample_id)
+                mask_path = self._resolve_raster_path(self.mask_root, mask_id)
 
             samples.append(
                 {
@@ -338,6 +354,11 @@ class SARDataset(Dataset):
         """
         try:
             with rasterio.open(img_path) as src:
+                if self.expected_img_bands is not None and src.count != self.expected_img_bands:
+                    raise ValueError(
+                        f"Expected {self.expected_img_bands} image bands for id '{sample_id}', "
+                        f"got {src.count} at '{img_path}'"
+                    )
                 img = src.read()  # (C, H, W)
         except RasterioIOError as e:
             raise RuntimeError(
