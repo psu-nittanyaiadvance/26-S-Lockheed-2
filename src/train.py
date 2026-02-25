@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
-from data_loader import PatchDataset, SARDataset
+from data_loader import PatchDataset, SARDataset, paired_ids, validate_sample_shapes
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
@@ -39,6 +39,151 @@ def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     
     # 5. Average the scores across all classes and batches, then subtract from 1
     return 1 - tversky_index.mean()
+
+def _extract_ignore_mask(metas, device, masks):
+    if masks is None or metas is None:
+        return None
+    if len(metas) == 0:
+        return None
+    h, w = masks.shape[-2:]
+    ignore_masks = []
+    found_any = False
+    for meta in metas:
+        ignore = meta.get("ignore_mask", None)
+        if ignore is None:
+            ignore_masks.append(torch.zeros((1, h, w), dtype=torch.bool, device=device))
+            continue
+        found_any = True
+        if not isinstance(ignore, torch.Tensor):
+            ignore = torch.as_tensor(ignore)
+        if ignore.ndim == 2:
+            ignore = ignore.unsqueeze(0)
+        elif ignore.ndim != 3:
+            raise ValueError("ignore_mask must have shape [H,W] or [1,H,W]")
+        if ignore.shape[0] != 1:
+            raise ValueError("ignore_mask must have shape [1,H,W]")
+        if tuple(ignore.shape[-2:]) != (h, w):
+            raise ValueError(
+                f"ignore_mask spatial shape mismatch: got {tuple(ignore.shape[-2:])}, "
+                f"expected {(h, w)}"
+            )
+        ignore_masks.append(ignore.to(device=device, dtype=torch.bool))
+    if not found_any:
+        return None
+    return torch.stack(ignore_masks, dim=0)
+
+def _apply_ignore_index(targets, ignore_mask, ignore_index):
+    if ignore_mask is None:
+        return targets
+    if not isinstance(ignore_mask, torch.Tensor):
+        ignore_mask = torch.as_tensor(ignore_mask)
+    if ignore_mask.ndim == targets.ndim + 1:
+        ignore_mask = ignore_mask.squeeze(1)
+    if ignore_mask.shape != targets.shape:
+        raise ValueError(
+            f"ignore_mask shape mismatch: got {tuple(ignore_mask.shape)}, "
+            f"expected {tuple(targets.shape)}"
+        )
+    masked = targets.clone()
+    masked[ignore_mask.bool()] = ignore_index
+    return masked
+
+def init_metric_state(n_classes):
+    if n_classes == 1:
+        return {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0, "n_classes": 1}
+    return {
+        "tp": [0.0] * n_classes,
+        "fp": [0.0] * n_classes,
+        "fn": [0.0] * n_classes,
+        "tn": [0.0] * n_classes,
+        "n_classes": n_classes,
+    }
+
+def update_metric_state(state, logits, masks, n_classes, ignore_mask=None):
+    if n_classes == 1:
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks_bin = masks.squeeze(1)
+        else:
+            masks_bin = masks
+        probs = torch.sigmoid(logits)
+        if probs.ndim == 4 and probs.shape[1] == 1:
+            probs = probs.squeeze(1)
+        preds = (probs > 0.5)
+        valid = torch.ones_like(masks_bin, dtype=torch.bool)
+        if ignore_mask is not None:
+            if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
+                ignore_mask = ignore_mask.squeeze(1)
+            valid = ~ignore_mask.bool()
+        true = masks_bin.bool()
+        pred = preds.bool()
+        tp = (pred & true & valid).sum().item()
+        fp = (pred & ~true & valid).sum().item()
+        fn = (~pred & true & valid).sum().item()
+        tn = (~pred & ~true & valid).sum().item()
+        state["tp"] += tp
+        state["fp"] += fp
+        state["fn"] += fn
+        state["tn"] += tn
+        return
+
+    if masks.ndim == 4 and masks.shape[1] == 1:
+        true = masks.squeeze(1).long()
+    else:
+        true = masks.long()
+    pred = logits.argmax(dim=1)
+    valid = torch.ones_like(true, dtype=torch.bool)
+    if ignore_mask is not None:
+        if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
+            ignore_mask = ignore_mask.squeeze(1)
+        valid = ~ignore_mask.bool()
+    for cl in range(n_classes):
+        pred_cl = (pred == cl)
+        true_cl = (true == cl)
+        tp = (pred_cl & true_cl & valid).sum().item()
+        fp = (pred_cl & ~true_cl & valid).sum().item()
+        fn = (~pred_cl & true_cl & valid).sum().item()
+        tn = (~pred_cl & ~true_cl & valid).sum().item()
+        state["tp"][cl] += tp
+        state["fp"][cl] += fp
+        state["fn"][cl] += fn
+        state["tn"][cl] += tn
+
+def finalize_metrics(state, n_classes):
+    if n_classes == 1:
+        tp = state["tp"]
+        fp = state["fp"]
+        fn = state["fn"]
+        union = tp + fp + fn
+        if union == 0:
+            iou = float("nan")
+            dice = float("nan")
+        else:
+            iou = tp / union
+            denom = (2 * tp + fp + fn)
+            dice = float("nan") if denom == 0 else (2 * tp / denom)
+        return {"iou": iou, "dice": dice}
+
+    ious = []
+    dices = []
+    for cl in range(n_classes):
+        tp = state["tp"][cl]
+        fp = state["fp"][cl]
+        fn = state["fn"][cl]
+        union = tp + fp + fn
+        if union == 0:
+            iou = float("nan")
+            dice = float("nan")
+        else:
+            iou = tp / union
+            denom = (2 * tp + fp + fn)
+            dice = float("nan") if denom == 0 else (2 * tp / denom)
+        ious.append(iou)
+        dices.append(dice)
+    valid_ious = [v for v in ious if v == v]
+    valid_dices = [v for v in dices if v == v]
+    mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else float("nan")
+    mean_dice = sum(valid_dices) / len(valid_dices) if valid_dices else float("nan")
+    return {"iou": mean_iou, "dice": mean_dice, "iou_per_class": ious, "dice_per_class": dices}
 
 def train_model(
         model,
@@ -83,7 +228,7 @@ def train_model(
         #create progress bar as a 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as progress_bar:
             for batch in train_loader:
-                images, true_masks = batch['image'], batch['mask']
+                images, true_masks, valid_mask = batch['image'], batch['mask'], batch['valid_mask']
 
                 #check for correct dimensionality
                 assert images.shape[1] == model.n_channels, \
@@ -94,6 +239,7 @@ def train_model(
                 #format and load to device
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
+                valid_mask = valid_mask.to(device=device)
 
                 #forward pass
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
@@ -102,11 +248,15 @@ def train_model(
                     if model.n_classes == 1:
                         # Add a channel dimension to true_masks so it matches masks_pred shape [Batch, 1, Height, Width]
                         target_masks = true_masks.unsqueeze(1).float()
-                        loss = criterion(masks_pred, target_masks)
+                        loss_px = criterion(masks_pred, target_masks)
                     else:
                         # One-hot encode the target masks and rearrange dimensions to match masks_pred
                         target_masks = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
-                        loss = criterion(masks_pred, target_masks)
+                        loss_px = criterion(masks_pred, target_masks)
+                    vm = valid_mask
+                    if loss_px.ndim == 4 and vm.ndim == 3:
+                        vm = vm.unsqueeze(1)
+                    loss = (loss_px * vm).sum() / vm.sum().clamp(1)
                         
                 #clear previous gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -223,6 +373,15 @@ if __name__ == '__main__':
     for ext in ('*.tif', '*.tiff'):
         ids.extend([p.stem for p in img_dir.glob(ext)])
     ids = sorted(set(ids))
+    paired, report = paired_ids(img_dir, mask_dir)
+    logging.info(
+        "Paired ID report: missing_in_images=%s missing_in_masks=%s (paired=%s)",
+        report["missing_in_images"],
+        report["missing_in_masks"],
+        report["paired_total"],
+    )
+    if report["paired_total"] == 0:
+        raise ValueError("No paired image/mask IDs found; aborting training.")
     base_dataset = SARDataset(
         img_root=img_dir,
         mask_root=mask_dir,
@@ -232,6 +391,7 @@ if __name__ == '__main__':
         expected_img_bands=2,
     )
     base_dataset.mask_values = [0, 1]
+    validate_sample_shapes(base_dataset, n=64)
     val_percent = args.val / 100
     n_val = int(len(base_dataset) * val_percent)
     n_train = len(base_dataset) - n_val
@@ -245,7 +405,26 @@ if __name__ == '__main__':
     def _dict_collate(batch):
         images = torch.stack([b[0] for b in batch], dim=0)
         masks = torch.stack([b[1] for b in batch], dim=0)
-        return {'image': images, 'mask': masks}
+        valid_masks = []
+        for b in batch:
+            meta = b[2]
+            vm = meta.get("valid_mask", None)
+            if vm is None:
+                raise KeyError("Sample metadata is missing 'valid_mask'.")
+            if not isinstance(vm, torch.Tensor):
+                vm = torch.as_tensor(vm)
+            if vm.shape[-2:] != b[0].shape[-2:]:
+                y0 = meta.get("patch_y0", None)
+                x0 = meta.get("patch_x0", None)
+                ps = meta.get("patch_size", None)
+                if y0 is not None and x0 is not None and ps is not None:
+                    if vm.ndim == 2:
+                        vm = vm[y0 : y0 + ps, x0 : x0 + ps]
+                    elif vm.ndim == 3:
+                        vm = vm[:, y0 : y0 + ps, x0 : x0 + ps]
+            valid_masks.append(vm)
+        valid_masks = torch.stack(valid_masks, dim=0)
+        return {'image': images, 'mask': masks, 'valid_mask': valid_masks}
 
     num_workers = getattr(args, 'num_workers', 0)
     train_loader = DataLoader(

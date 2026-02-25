@@ -8,7 +8,9 @@ from torch.utils.data import Dataset
 
 
 def compute_running_mean_std(
-    dataset: Dataset, max_samples: Optional[int] = None
+    dataset: Dataset,
+    max_samples: Optional[int] = None,
+    require_no_transforms: bool = False,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Compute per-band mean/std using Welford's algorithm (streaming).
@@ -27,6 +29,8 @@ def compute_running_mean_std(
     """
     if len(dataset) == 0:
         raise ValueError("Dataset is empty")
+    if require_no_transforms and getattr(dataset, "transforms", None) is not None:
+        raise ValueError("Transforms are enabled; disable transforms for statistics.")
 
     total = len(dataset) if max_samples is None else min(len(dataset), max_samples)
 

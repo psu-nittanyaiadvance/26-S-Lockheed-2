@@ -49,10 +49,11 @@ def default_collate(
         meta = dict(b[2])  # shallow copy so we don't mutate the original
         vm = meta.pop("valid_mask", None)
         if vm is None:
-            raise KeyError(
-                "Sample metadata is missing 'valid_mask'. "
-                "Ensure SARDataset is up to date."
-            )
+            vm = torch.ones(b[0].shape[-2:], dtype=torch.bool)
+        if not isinstance(vm, torch.Tensor):
+            vm = torch.as_tensor(vm)
+        if vm.ndim == 3 and vm.shape[0] == 1:
+            vm = vm.squeeze(0)
         valid_mask_list.append(vm)
         metas.append(meta)
 

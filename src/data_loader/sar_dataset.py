@@ -442,7 +442,12 @@ class SARDataset(Dataset):
         img_path = sample["img_path"]
         mask_path = sample["mask_path"]
 
-        img, valid_mask = self._load_image(img_path, sample_id)
+        img_out = self._load_image(img_path, sample_id)
+        if isinstance(img_out, tuple) and len(img_out) == 2:
+            img, valid_mask = img_out
+        else:
+            img = img_out
+            valid_mask = np.ones((img.shape[1], img.shape[2]), dtype=bool)
         img_tensor = torch.from_numpy(img).float()
 
         # valid_mask: bool tensor [H, W], False where any band was NaN/Inf.
@@ -450,11 +455,35 @@ class SARDataset(Dataset):
         valid_mask_tensor = torch.from_numpy(valid_mask)  # dtype=torch.bool
 
         mask_tensor: Optional[torch.Tensor] = None
+        ignore_mask_tensor: Optional[torch.Tensor] = None
         if self.mode != "none":
             if mask_path is None:
                 raise RuntimeError(f"Missing mask path for id '{sample_id}'")
-            mask = self._load_mask(mask_path, (img.shape[1], img.shape[2]), sample_id)
+            mask_out = self._load_mask(mask_path, (img.shape[1], img.shape[2]), sample_id)
+            if isinstance(mask_out, tuple) and len(mask_out) == 2:
+                mask, ignore_mask = mask_out
+            else:
+                mask = mask_out
+                ignore_mask = None
             mask_tensor = torch.from_numpy(mask)
+            if ignore_mask is not None:
+                if not isinstance(ignore_mask, torch.Tensor):
+                    ignore_mask_tensor = torch.as_tensor(ignore_mask)
+                else:
+                    ignore_mask_tensor = ignore_mask
+                if ignore_mask_tensor.ndim == 2:
+                    ignore_mask_tensor = ignore_mask_tensor.unsqueeze(0)
+                elif ignore_mask_tensor.ndim != 3:
+                    raise ValueError("ignore_mask must have shape [H,W] or [1,H,W]")
+                if ignore_mask_tensor.shape[0] != 1:
+                    raise ValueError("ignore_mask must have shape [1,H,W]")
+                if tuple(ignore_mask_tensor.shape[-2:]) != tuple(mask_tensor.shape[-2:]):
+                    raise ValueError(
+                        "ignore_mask spatial shape mismatch: "
+                        f"got {tuple(ignore_mask_tensor.shape[-2:])}, "
+                        f"expected {tuple(mask_tensor.shape[-2:])}"
+                    )
+                ignore_mask_tensor = ignore_mask_tensor.to(dtype=torch.bool)
 
         metadata: Dict[str, Any] = {
             "id": sample_id,
@@ -464,6 +493,8 @@ class SARDataset(Dataset):
             #   loss = (criterion(pred, target) * valid_mask).sum() / valid_mask.sum().clamp(1)
             "valid_mask": valid_mask_tensor,
         }
+        if ignore_mask_tensor is not None:
+            metadata["ignore_mask"] = ignore_mask_tensor
 
         if self.use_time_matched:
             metadata["time_matched_path"] = None
@@ -495,6 +526,7 @@ class SARDataset(Dataset):
                 metadata["time_matched_status"] = tm_status or "ok"
 
         if self.transforms is not None:
+            had_ignore_mask = "ignore_mask" in metadata
             out = self.transforms(img_tensor, mask_tensor, metadata)
             if isinstance(out, tuple) and len(out) == 3:
                 img_tensor, mask_tensor, metadata = out
@@ -502,5 +534,7 @@ class SARDataset(Dataset):
                 img_tensor, mask_tensor = out
             else:
                 raise ValueError("transforms must return (image, mask, metadata) or (image, mask)")
+            if had_ignore_mask and "ignore_mask" not in metadata:
+                raise ValueError("dropped metadata['ignore_mask']")
 
         return img_tensor, mask_tensor, metadata

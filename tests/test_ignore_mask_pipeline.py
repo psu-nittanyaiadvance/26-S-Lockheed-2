@@ -80,7 +80,7 @@ def test_ignore_mask_end_to_end_pipeline(monkeypatch) -> None:
     patch_ds = PatchDataset(base_ds, patch_size=2, overlap=0.0)
     loader = DataLoader(patch_ds, batch_size=2, shuffle=False, collate_fn=default_collate)
 
-    images, masks, metas = next(iter(loader))
+    images, masks, _, metas = next(iter(loader))
     assert masks is not None
 
     ignore_mask = _extract_ignore_mask(metas, torch.device("cpu"), masks)
