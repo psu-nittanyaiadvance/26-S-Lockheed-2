@@ -299,7 +299,7 @@ def train_model(
                             if isinstance(v, (int, float)):
                                 writer.add_scalar(f'Validation/{k}', v, global_step)
                                 
-                        scheduler.step(val_score["val_mIoU"])
+                        scheduler.step(val_score["val_IoU"])
 
                         # 3. Log Scalars and Images to TensorBoard
                         try:
@@ -316,7 +316,7 @@ def train_model(
                             writer.add_image('Visuals/Image', images[0].cpu(), global_step)
                             
                             # Ground Truth Mask (adding channel dim)
-                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
+                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu(), global_step)
                             
                             # Predicted Mask (taking argmax and adding channel dim)
                             pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
