@@ -323,6 +323,7 @@ def train_model(
                             writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
                         except Exception as e:
                             logging.warning(f"Could not log to TensorBoard: {e}")
+        
         print(
             f"Validation Results:\n"
             f"  Loss:      {val_score['val_loss']:.4f}\n"
