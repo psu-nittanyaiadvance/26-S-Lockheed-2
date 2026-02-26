@@ -298,17 +298,18 @@ def train_model(
                             # TensorBoard expects numeric scalars; skip non-scalars defensively
                             if isinstance(v, (int, float)):
                                 writer.add_scalar(f'Validation/{k}', v, global_step)
-
-
                                 
-                        scheduler.step(val_score["miou"])
-
-                        
+                        scheduler.step(val_score["val_mIoU"])
 
                         # 3. Log Scalars and Images to TensorBoard
                         try:
                             writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
-                            writer.add_scalar('Validation/Dice', val_score, global_step)
+                            # This groups them together in the UI
+                            writer.add_scalars('Validation/Flood_Metrics', {
+                                'Precision': val_score['val_flood_precision'],
+                                'Recall': val_score['val_flood_recall'],
+                                'F1': val_score['val_flood_f1']
+                                }, global_step)
                             
                             # Log the first image in the batch
                             # Note: TensorBoard expects (C, H, W)
@@ -322,6 +323,17 @@ def train_model(
                             writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
                         except Exception as e:
                             logging.warning(f"Could not log to TensorBoard: {e}")
+        print(
+            f"Validation Results:\n"
+            f"  Loss:      {val_score['val_loss']:.4f}\n"
+            f"  Accuracy:  {val_score['val_accuracy']:.4f}\n"
+            f"  mIoU:      {val_score['val_mIoU']:.4f}\n"
+            f"  Flood Metrics -> "
+            f"IoU: {val_score['val_flood_iou']:.4f} | "
+            f"Prec: {val_score['val_flood_precision']:.4f} | "
+            f"Recall: {val_score['val_flood_recall']:.4f} | "
+            f"F1: {val_score['val_flood_f1']:.4f}"
+        )
         
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
