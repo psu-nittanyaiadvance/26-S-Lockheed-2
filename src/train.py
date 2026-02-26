@@ -16,7 +16,7 @@ from tqdm import tqdm
 
 from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
-from data_loader import PatchDataset, SARDataset, paired_ids, validate_sample_shapes
+from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
@@ -204,12 +204,14 @@ def train_model(
         ):
 
     #optimizer setup
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
     model.parameters(), 
     lr=learning_rate, 
     betas=adam_betas, 
     weight_decay=weight_decay
     )
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
 
     writer = SummaryWriter(comment=f'LR_{learning_rate}_BS_{batch_size}')
     logging.info(f"Hyperparameters: {locals()}")
@@ -291,7 +293,17 @@ def train_model(
                         # 2. Run Evaluation
                         val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
 
-                        logging.info(f'Validation Dice score: {val_score}')
+                        # val_score is a dict from evaluate()
+                        for k, v in val_score.items():
+                            # TensorBoard expects numeric scalars; skip non-scalars defensively
+                            if isinstance(v, (int, float)):
+                                writer.add_scalar(f'Validation/{k}', v, global_step)
+
+
+                                
+                        scheduler.step(val_score["miou"])
+
+                        
 
                         # 3. Log Scalars and Images to TensorBoard
                         try:
@@ -369,25 +381,34 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     img_dir = Path(args.img_dir)
     mask_dir = Path(args.mask_dir)
-    ids = []
-    for ext in ('*.tif', '*.tiff'):
-        ids.extend([p.stem for p in img_dir.glob(ext)])
-    ids = sorted(set(ids))
-    paired, report = paired_ids(img_dir, mask_dir)
+    mask_id_suffix_map = {'S1Hand': 'S1OtsuLabelHand'}
+    ids = list_ids_from_dir(args.img_dir, recursive=True)
+    paired_ids_list = []
+    missing_in_masks = 0
+    for image_id in ids:
+        mask_id = image_id
+        if image_id.endswith("S1Hand"):
+            mask_id = f"{image_id[:-len('S1Hand')]}S1OtsuLabelHand"
+        mask_tif = mask_dir / f"{mask_id}.tif"
+        mask_tiff = mask_dir / f"{mask_id}.tiff"
+        if mask_tif.exists() or mask_tiff.exists():
+            paired_ids_list.append(image_id)
+        else:
+            missing_in_masks += 1
     logging.info(
-        "Paired ID report: missing_in_images=%s missing_in_masks=%s (paired=%s)",
-        report["missing_in_images"],
-        report["missing_in_masks"],
-        report["paired_total"],
+        "Paired ID report: images_total=%s paired_total=%s missing_in_masks=%s",
+        len(ids),
+        len(paired_ids_list),
+        missing_in_masks,
     )
-    if report["paired_total"] == 0:
+    if len(paired_ids_list) == 0:
         raise ValueError("No paired image/mask IDs found; aborting training.")
     base_dataset = SARDataset(
         img_root=img_dir,
         mask_root=mask_dir,
-        ids_or_paths=ids,
+        ids_or_paths=paired_ids_list,
         mode='strong',
-        mask_id_suffix_map={'S1Hand': 'S1OtsuLabelHand'},
+        mask_id_suffix_map=mask_id_suffix_map,
         expected_img_bands=2,
     )
     base_dataset.mask_values = [0, 1]
