@@ -18,7 +18,9 @@ from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
-def tversky_loss(inputs, targets, alpha, beta, valid_mask=None, epsilon=1e-6):
+
+# A common gamma default in medical imaging literature is 4/3 (approx 1.33).
+def focal_tversky_loss(inputs, targets, alpha, beta, gamma, valid_mask=None, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
     
@@ -39,7 +41,6 @@ def tversky_loss(inputs, targets, alpha, beta, valid_mask=None, epsilon=1e-6):
         # If no mask provided, treat all pixels as valid
         valid_mask = torch.ones((inputs.shape[0], 1, inputs.shape[2]), device=inputs.device, dtype=inputs.dtype)
 
-    # 3. Calculate True Positives, False Positives, and False Negatives
     # We sum across dim=2 (the flattened pixels) to get totals PER CLASS
     # Invalid pixels are excluded via multiplication by valid_mask
     TP = (inputs * targets * valid_mask).sum(dim=2)    
@@ -49,8 +50,15 @@ def tversky_loss(inputs, targets, alpha, beta, valid_mask=None, epsilon=1e-6):
     # 4. Calculate the Tversky index (Yields a score for each class, per image)
     tversky_index = (TP + epsilon) / (TP + alpha * FP + beta * FN + epsilon)
     
-    # 5. Average the scores across all classes and batches, then subtract from 1
-    return 1 - tversky_index.mean()
+    # CHANGE 2: Apply the focal transformation (1 - TI)^gamma before taking the mean.
+    # WHY: The standard Tversky loss is (1 - TI). By taking (1 - TI) and raising it 
+    # to the power of gamma, we squash the loss for "easy" predictions (where TI is close to 1) 
+    # to near zero. We must do this *before* the mean so the non-linear scaling applies 
+    # accurately to each individual class/image score.
+    focal_tversky = torch.pow((1 - tversky_index), (1/gamma))
+    
+    # 5. Average the focal scores across all classes and batches
+    return focal_tversky.mean()
 
 def _extract_ignore_mask(metas, device, masks):
     if masks is None or metas is None:
@@ -211,6 +219,7 @@ def train_model(
         gradient_clipping: float = 0.5,
         tv_alpha = 0.3, #confirm default for Tversky alpha
         tv_beta = 0.7, #confirm default for Tversky beta
+        tv_gamma= 0.75,
         adam_betas = (0.9, 0.999),
         n_classes = 1
         ):
@@ -263,7 +272,7 @@ def train_model(
 
                 
                 #define loss function with Tversky
-                criterion = lambda inputs, targets, vm=None: tversky_loss(
+                criterion = lambda inputs, targets, vm=None: focal_tversky_loss(
                     inputs, targets,
                     alpha=tv_alpha,
                     beta=tv_beta,
