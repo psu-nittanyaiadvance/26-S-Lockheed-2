@@ -18,10 +18,15 @@ def evaluate(net, dataloader, device, amp, criterion, n_classes):
     with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
         for batch in tqdm(dataloader, total=num_val_batches, desc='Validation round', unit='batch', leave=False):
             image, mask_true = batch['image'], batch['mask']
+            valid_mask = batch.get('valid_mask', None)
+
 
             # Move to device
             image = image.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
             mask_true = mask_true.to(device=device, dtype=torch.long)
+
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(device=device).bool()
 
             # 1. Forward Pass & Loss (Matching your training logic)
             mask_pred = net(image)

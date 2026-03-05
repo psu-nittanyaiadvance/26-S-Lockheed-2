@@ -18,7 +18,7 @@ from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
-def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
+def tversky_loss(inputs, targets, alpha, beta, valid_mask=None, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
     
@@ -27,12 +27,24 @@ def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # Shape changes from [Batch, Classes, Height, Width] -> [Batch, Classes, Pixels]
     inputs = inputs.view(inputs.shape[0], inputs.shape[1], -1)
     targets = targets.view(targets.shape[0], targets.shape[1], -1)
-    
+
+    if valid_mask is not None:
+        # Force valid_mask to align with [B, C, Pixels]
+        # Accepts [B,H,W] or [B,1,H,W] and converts to [B,1,Pixels]
+        if valid_mask.ndim == 3:
+            valid_mask = valid_mask.unsqueeze(1)  # [B,1,H,W]
+        # Now flatten spatial dims to Pixels using the SAME Pixels length as inputs
+        valid_mask = valid_mask.reshape(inputs.shape[0], 1, inputs.shape[2]).to(inputs.dtype)
+    else:
+        # If no mask provided, treat all pixels as valid
+        valid_mask = torch.ones((inputs.shape[0], 1, inputs.shape[2]), device=inputs.device, dtype=inputs.dtype)
+
     # 3. Calculate True Positives, False Positives, and False Negatives
     # We sum across dim=2 (the flattened pixels) to get totals PER CLASS
-    TP = (inputs * targets).sum(dim=2)    
-    FP = ((1 - targets) * inputs).sum(dim=2)
-    FN = (targets * (1 - inputs)).sum(dim=2)
+    # Invalid pixels are excluded via multiplication by valid_mask
+    TP = (inputs * targets * valid_mask).sum(dim=2)    
+    FP = ((1 - targets) * inputs * valid_mask).sum(dim=2)
+    FN = (targets * (1 - inputs) * valid_mask).sum(dim=2)
     
     # 4. Calculate the Tversky index (Yields a score for each class, per image)
     tversky_index = (TP + epsilon) / (TP + alpha * FP + beta * FN + epsilon)
@@ -190,15 +202,15 @@ def train_model(
         device,
         epochs: int = 5,
         batch_size: int = 1,
-        learning_rate: float = 1e-5,
+        learning_rate: float = 1e-4,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
-        weight_decay: float = 1e-8,
-        gradient_clipping: float = 1.0,
-        tv_alpha = 0.7, #confirm default for Tversky alpha
-        tv_beta = 0.3, #confirm default for Tversky beta
+        weight_decay: float = 5e-3,
+        gradient_clipping: float = 0.5,
+        tv_alpha = 0.3, #confirm default for Tversky alpha
+        tv_beta = 0.7, #confirm default for Tversky beta
         adam_betas = (0.9, 0.999),
         n_classes = 1
         ):
@@ -213,11 +225,10 @@ def train_model(
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
 
-    writer = SummaryWriter(comment=f'LR_{learning_rate}_BS_{batch_size}')
+    writer = SummaryWriter(log_dir=output_dir / 'logs')
     logging.info(f"Hyperparameters: {locals()}")
 
-    #define loss function with Tversky
-    criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
+    
 
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
@@ -247,18 +258,20 @@ def train_model(
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
                     
-                    if model.n_classes == 1:
-                        # Add a channel dimension to true_masks so it matches masks_pred shape [Batch, 1, Height, Width]
-                        target_masks = true_masks.unsqueeze(1).float()
-                        loss_px = criterion(masks_pred, target_masks)
-                    else:
-                        # One-hot encode the target masks and rearrange dimensions to match masks_pred
-                        target_masks = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
-                        loss_px = criterion(masks_pred, target_masks)
-                    vm = valid_mask
-                    if loss_px.ndim == 4 and vm.ndim == 3:
-                        vm = vm.unsqueeze(1)
-                    loss = (loss_px * vm).sum() / vm.sum().clamp(1)
+                    # true_masks assumed [B,1,H,W] already
+                target_masks = true_masks.float()
+
+                
+                #define loss function with Tversky
+                criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
+                
+                loss = tversky_loss(
+                    masks_pred,
+                    target_masks,
+                    alpha=tv_alpha,
+                    beta=tv_beta,
+                    valid_mask=valid_mask
+                )
                         
                 #clear previous gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -299,7 +312,7 @@ def train_model(
                             if isinstance(v, (int, float)):
                                 writer.add_scalar(f'Validation/{k}', v, global_step)
                                 
-                        scheduler.step(val_score["val_IoU"])
+                        scheduler.step(val_score["val_flood_iou"])
 
                         # 3. Log Scalars and Images to TensorBoard
                         try:
@@ -319,7 +332,12 @@ def train_model(
                             writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu(), global_step)
                             
                             # Predicted Mask (taking argmax and adding channel dim)
-                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
+                            if args.classes == 1:
+                                # masks_pred: [B,1,H,W]
+                                pred_mask = (torch.sigmoid(masks_pred)[0, 0] > 0.5).float().cpu().unsqueeze(0)  # [1,H,W]
+                            else:
+                                pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)  # [1,H,W]
+                            
                             writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
                         except Exception as e:
                             logging.warning(f"Could not log to TensorBoard: {e}")
@@ -328,7 +346,7 @@ def train_model(
             f"Validation Results:\n"
             f"  Loss:      {val_score['val_loss']:.4f}\n"
             f"  Accuracy:  {val_score['val_accuracy']:.4f}\n"
-            f"  mIoU:      {val_score['val_mIoU']:.4f}\n"
+            f"  Flood IoU:      {val_score['val_flood_iou']:.4f}\n"
             f"  Flood Metrics -> "
             f"IoU: {val_score['val_flood_iou']:.4f} | "
             f"Prec: {val_score['val_flood_precision']:.4f} | "
@@ -365,6 +383,7 @@ def get_args():
     parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .tif/.tiff files')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--output-dir', type=str, default='runs/default',help='Directory to save logs and checkpoints')
 
     return parser.parse_args()
 
@@ -373,6 +392,11 @@ def get_args():
 #argparse usage in main
 if __name__ == '__main__':
     args = get_args()
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = UNetModel(n_channels=2, n_classes=args.classes, bilinear=args.bilinear)
@@ -477,7 +501,7 @@ if __name__ == '__main__':
             num_workers=num_workers,
             collate_fn=_dict_collate
         )
-    dir_checkpoint = Path('checkpoints')
+    dir_checkpoint = output_dir / 'checkpoints'
     try:
         train_model(
             model=model,
