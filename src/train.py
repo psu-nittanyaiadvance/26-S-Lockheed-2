@@ -223,7 +223,7 @@ def train_model(
     weight_decay=weight_decay
     )
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.5, patience=6)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
 
     writer = SummaryWriter(log_dir=output_dir / 'logs')
     logging.info(f"Hyperparameters: {locals()}")
@@ -263,15 +263,14 @@ def train_model(
 
                 
                 #define loss function with Tversky
-                criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
-                
-                loss = tversky_loss(
-                    masks_pred,
-                    target_masks,
+                criterion = lambda inputs, targets, vm=None: tversky_loss(
+                    inputs, targets,
                     alpha=tv_alpha,
                     beta=tv_beta,
-                    valid_mask=valid_mask
+                    valid_mask=vm
                 )
+                                
+                loss = criterion(masks_pred, target_masks, valid_mask)
                         
                 #clear previous gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -291,62 +290,65 @@ def train_model(
                 progress_bar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # --- Evaluation round (Local Logging Version) ---
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0 and val_loader is not None:
-                    if global_step % division_step == 0:
-                        # 1. Log Weights and Gradients Histograms
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
-                            if value.grad is not None:
-                                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                    writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
+                if val_loader is not None and progress_bar.n >= n_train:
+                    # 1. Log Weights and Gradients Histograms
+                    for tag, value in model.named_parameters():
+                        tag = tag.replace('/', '.')
+                        if not (torch.isinf(value) | torch.isnan(value)).any():
+                            writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
+                        if value.grad is not None:
+                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
 
-                        # 2. Run Evaluation
-                        val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
+                    # 2. Run Evaluation
+                    val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
 
-                        # val_score is a dict from evaluate()
-                        for k, v in val_score.items():
-                            # TensorBoard expects numeric scalars; skip non-scalars defensively
-                            if isinstance(v, (int, float)):
-                                writer.add_scalar(f'Validation/{k}', v, global_step)
-                                
-                        scheduler.step(val_score["val_flood_iou"])
+                    # val_score is a dict from evaluate()
+                    for k, v in val_score.items():
+                        # TensorBoard expects numeric scalars; skip non-scalars defensively
+                        if isinstance(v, (int, float)):
+                            writer.add_scalar(f'Validation/{k}', v, global_step)
+                            
+                    
+                    scheduler.step(val_score["val_flood_iou"])
 
-                        # 3. Log Scalars and Images to TensorBoard
-                        try:
-                            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
-                            # This groups them together in the UI
-                            writer.add_scalars('Validation/Flood_Metrics', {
-                                'Precision': val_score['val_flood_precision'],
-                                'Recall': val_score['val_flood_recall'],
-                                'F1': val_score['val_flood_f1']
-                                }, global_step)
-                            
-                            # Log the first image in the batch
-                            # Note: TensorBoard expects (C, H, W)
-                            writer.add_image('Visuals/Image', images[0].cpu(), global_step)
-                            
-                            # Ground Truth Mask (adding channel dim)
-                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu(), global_step)
-                            
-                            # Predicted Mask (taking argmax and adding channel dim)
-                            if args.classes == 1:
-                                # masks_pred: [B,1,H,W]
-                                pred_mask = (torch.sigmoid(masks_pred)[0, 0] > 0.5).float().cpu().unsqueeze(0)  # [1,H,W]
-                            else:
-                                pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)  # [1,H,W]
-                            
-                            writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
-                        except Exception as e:
-                            logging.warning(f"Could not log to TensorBoard: {e}")
+                    # 3. Log Scalars and Images to TensorBoard
+                    try:
+                        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                        # This groups them together in the UI
+                        writer.add_scalars('Validation/Flood_Metrics', {
+                            'Precision': val_score['val_flood_precision'],
+                            'Recall': val_score['val_flood_recall'],
+                            'F1': val_score['val_flood_f1']
+                            }, global_step)
+                        
+                        # Log the first image in the batch
+                        # Note: TensorBoard expects (C, H, W)
+                        writer.add_image('Visuals/Image', images[0].cpu(), global_step)
+                        
+                        # Ground Truth Mask (adding channel dim)
+                        writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu(), global_step)
+                        
+                        # Predicted Mask (taking argmax and adding channel dim)
+                        if args.classes == 1:
+                            # masks_pred: [B,1,H,W]
+                            pred_mask = (torch.sigmoid(masks_pred)[0, 0] > 0.5).float().cpu().unsqueeze(0)  # [1,H,W]
+                        else:
+                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)  # [1,H,W]
+                        
+                        writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
+                    except Exception as e:
+                        logging.warning(f"Could not log to TensorBoard: {e}")
+
         
+            
+
         print(
             f"Validation Results:\n"
+            f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n"
             f"  Loss:      {val_score['val_loss']:.4f}\n"
             f"  Accuracy:  {val_score['val_accuracy']:.4f}\n"
-            f"  Flood IoU:      {val_score['val_flood_iou']:.4f}\n"
+            f"  mIoU:      {val_score['val_mIoU']:.4f}\n"
             f"  Flood Metrics -> "
             f"IoU: {val_score['val_flood_iou']:.4f} | "
             f"Prec: {val_score['val_flood_precision']:.4f} | "
