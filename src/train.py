@@ -14,6 +14,13 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
+from binary_mode import (
+    ACTIVE_BINARY_METRIC_THRESHOLD,
+    compute_binary_confusion,
+    prepare_binary_target,
+    prepare_binary_valid_mask,
+    require_active_binary_mode,
+)
 from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
@@ -23,6 +30,10 @@ from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sa
 def focal_tversky_loss(inputs, targets, alpha, beta, gamma=0.75, valid_mask=None, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
+
+    if inputs.shape[1] == 1:
+        targets = prepare_binary_target(targets).to(device=inputs.device, dtype=inputs.dtype)
+        valid_mask = prepare_binary_valid_mask(valid_mask, inputs)
     
     # 2. Flatten ONLY the spatial dimensions (Height x Width)
     # This preserves the Batch (dim 0) and Class (dim 1) boundaries
@@ -128,29 +139,19 @@ def init_metric_state(n_classes):
 
 def update_metric_state(state, logits, masks, n_classes, ignore_mask=None):
     if n_classes == 1:
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks_bin = masks.squeeze(1)
-        else:
-            masks_bin = masks
-        probs = torch.sigmoid(logits)
-        if probs.ndim == 4 and probs.shape[1] == 1:
-            probs = probs.squeeze(1)
-        preds = (probs > 0.3)
-        valid = torch.ones_like(masks_bin, dtype=torch.bool)
+        valid_mask = None
         if ignore_mask is not None:
-            if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
-                ignore_mask = ignore_mask.squeeze(1)
-            valid = ~ignore_mask.bool()
-        true = masks_bin.bool()
-        pred = preds.bool()
-        tp = (pred & true & valid).sum().item()
-        fp = (pred & ~true & valid).sum().item()
-        fn = (~pred & true & valid).sum().item()
-        tn = (~pred & ~true & valid).sum().item()
-        state["tp"] += tp
-        state["fp"] += fp
-        state["fn"] += fn
-        state["tn"] += tn
+            valid_mask = ~prepare_binary_valid_mask(ignore_mask, logits)
+        confusion = compute_binary_confusion(
+            logits,
+            masks,
+            valid_mask=valid_mask,
+            threshold=ACTIVE_BINARY_METRIC_THRESHOLD,
+        )
+        state["tp"] += confusion["tp"].item()
+        state["fp"] += confusion["fp"].item()
+        state["fn"] += confusion["fn"].item()
+        state["tn"] += confusion["tn"].item()
         return
 
     if masks.ndim == 4 and masks.shape[1] == 1:
@@ -212,6 +213,10 @@ def finalize_metrics(state, n_classes):
     mean_dice = sum(valid_dices) / len(valid_dices) if valid_dices else float("nan")
     return {"iou": mean_iou, "dice": mean_dice, "iou_per_class": ious, "dice_per_class": dices}
 
+
+def should_save_checkpoint(epoch, epochs, save_every=50):
+    return epoch == epochs or (save_every > 0 and epoch % save_every == 0)
+
 def train_model(
         model,
         device,
@@ -230,6 +235,11 @@ def train_model(
         adam_betas = (0.9, 0.999),
         n_classes = 1
         ):
+    """
+    Active supported mode: Phase 1 SAR-only binary flood segmentation.
+    Multiclass training remains in the repo but is not supported on this path.
+    """
+    require_active_binary_mode(n_classes, "train_model()")
 
     #optimizer setup
     optimizer = optim.AdamW(
@@ -263,6 +273,7 @@ def train_model(
         #model into training mode
         model.train()
         epoch_loss = 0
+        last_val_score = None
 
         #create progress bar as a 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as progress_bar:
@@ -277,17 +288,17 @@ def train_model(
 
                 #format and load to device
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                true_masks = true_masks.to(device=device)
                 valid_mask = valid_mask.to(device=device)
 
                 #forward pass
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    
-                    # true_masks assumed [B,1,H,W] already
-                target_masks = true_masks.float()
-
-                loss = criterion(masks_pred, target_masks, valid_mask)
+                    target_masks = prepare_binary_target(true_masks).to(
+                        device=device, dtype=masks_pred.dtype
+                    )
+                    valid_mask = prepare_binary_valid_mask(valid_mask, masks_pred)
+                    loss = criterion(masks_pred, target_masks, valid_mask)
                         
                 #clear previous gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -318,7 +329,8 @@ def train_model(
                                 writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
 
                     # 2. Run Evaluation
-                    val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
+                    val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=n_classes)
+                    last_val_score = val_score
 
                     # val_score is a dict from evaluate()
                     for k, v in val_score.items():
@@ -344,40 +356,44 @@ def train_model(
                         writer.add_image('Visuals/Image', images[0].cpu(), global_step)
                         
                         # Ground Truth Mask (adding channel dim)
-                        writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu(), global_step)
+                        writer.add_image('Visuals/Mask_True', target_masks[0].float().cpu(), global_step)
                         
-                        # Predicted Mask (taking argmax and adding channel dim)
-                        if args.classes == 1:
-                            # masks_pred: [B,1,H,W]
-                            pred_mask = (torch.sigmoid(masks_pred)[0, 0] > 0.5).float().cpu().unsqueeze(0)  # [1,H,W]
-                        else:
-                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)  # [1,H,W]
+                        # Visualization uses the active validation threshold but is not reused by metric code.
+                        pred_mask = (
+                            torch.sigmoid(masks_pred)[0, 0] > ACTIVE_BINARY_METRIC_THRESHOLD
+                        ).float().cpu().unsqueeze(0)
                         
                         writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
                     except Exception as e:
                         logging.warning(f"Could not log to TensorBoard: {e}")
 
         
-            
-
-        print(
-            f"Validation Results:\n"
-            f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n"
-            f"  Loss:      {val_score['val_loss']:.4f}\n"
-            f"  Accuracy:  {val_score['val_accuracy']:.4f}\n"
-            f"  mIoU:      {val_score['val_mIoU']:.4f}\n"
-            f"  Flood Metrics -> "
-            f"IoU: {val_score['val_flood_iou']:.4f} | "
-            f"Prec: {val_score['val_flood_precision']:.4f} | "
-            f"Recall: {val_score['val_flood_recall']:.4f} | "
-            f"F1: {val_score['val_flood_f1']:.4f}"
-        )
+        if last_val_score is not None:
+            print(
+                f"Validation Results:\n"
+                f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n"
+                f"  Loss:      {last_val_score['val_loss']:.4f}\n"
+                f"  Accuracy:  {last_val_score['val_accuracy']:.4f}\n"
+                f"  mIoU:      {last_val_score['val_mIoU']:.4f}\n"
+                f"  Flood Metrics -> "
+                f"IoU: {last_val_score['val_flood_iou']:.4f} | "
+                f"Prec: {last_val_score['val_flood_precision']:.4f} | "
+                f"Recall: {last_val_score['val_flood_recall']:.4f} | "
+                f"F1: {last_val_score['val_flood_f1']:.4f}"
+            )
+        else:
+            print(
+                f"Epoch {epoch}/{epochs} complete:\n"
+                f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n"
+                f"  Train Loss: {(epoch_loss / max(len(train_loader), 1)):.4f}\n"
+                f"  Validation: disabled"
+            )
         
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            if(epoch % 50 == 0):
+            if should_save_checkpoint(epoch, epochs):
                 torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
                 logging.info(f'Checkpoint {epoch} saved!')
 
@@ -398,7 +414,13 @@ def get_args():
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument(
+        '--classes',
+        '-c',
+        type=int,
+        default=1,
+        help='Number of classes. Active Phase 1 training supports binary flood segmentation only (use 1).',
+    )
     parser.add_argument('--img-dir', type=str, required=True, help='Path to SAR image .tif/.tiff files')
     parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .tif/.tiff files')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
@@ -412,6 +434,7 @@ def get_args():
 #argparse usage in main
 if __name__ == '__main__':
     args = get_args()
+    require_active_binary_mode(args.classes, "train.py")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
