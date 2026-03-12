@@ -20,7 +20,7 @@ from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sa
 
 
 # A common gamma default in medical imaging literature is 4/3 (approx 1.33).
-def focal_tversky_loss(inputs, targets, alpha, beta, gamma, valid_mask=None, epsilon=1e-6):
+def focal_tversky_loss(inputs, targets, alpha, beta, gamma=0.75, valid_mask=None, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
     
@@ -49,16 +49,23 @@ def focal_tversky_loss(inputs, targets, alpha, beta, gamma, valid_mask=None, eps
     
     # 4. Calculate the Tversky index (Yields a score for each class, per image)
     tversky_index = (TP + epsilon) / (TP + alpha * FP + beta * FN + epsilon)
+
+    # NaN-safety for focal transform:
+    tversky_index = tversky_index.clamp(0.0, 1.0)
+    focal_base = (1.0 - tversky_index).clamp(min=epsilon, max=1.0)
+
     
     # CHANGE 2: Apply the focal transformation (1 - TI)^gamma before taking the mean.
     # WHY: The standard Tversky loss is (1 - TI). By taking (1 - TI) and raising it 
     # to the power of gamma, we squash the loss for "easy" predictions (where TI is close to 1) 
     # to near zero. We must do this *before* the mean so the non-linear scaling applies 
     # accurately to each individual class/image score.
-    focal_tversky = torch.pow((1 - tversky_index), (1/gamma))
-    
+    # Standard focal Tversky: (1 - TI)^gamma
+    focal_tversky = focal_base.pow(1/gamma)
+
     # 5. Average the focal scores across all classes and batches
     return focal_tversky.mean()
+    
 
 def _extract_ignore_mask(metas, device, masks):
     if masks is None or metas is None:
@@ -128,7 +135,7 @@ def update_metric_state(state, logits, masks, n_classes, ignore_mask=None):
         probs = torch.sigmoid(logits)
         if probs.ndim == 4 and probs.shape[1] == 1:
             probs = probs.squeeze(1)
-        preds = (probs > 0.5)
+        preds = (probs > 0.3)
         valid = torch.ones_like(masks_bin, dtype=torch.bool)
         if ignore_mask is not None:
             if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
@@ -217,8 +224,8 @@ def train_model(
         amp: bool = False,
         weight_decay: float = 5e-3,
         gradient_clipping: float = 0.5,
-        tv_alpha = 0.3, #confirm default for Tversky alpha
-        tv_beta = 0.7, #confirm default for Tversky beta
+        tv_alpha = 0.4, #confirm default for Tversky alpha
+        tv_beta = 0.6, #confirm default for Tversky beta
         tv_gamma= 0.75,
         adam_betas = (0.9, 0.999),
         n_classes = 1
@@ -232,7 +239,7 @@ def train_model(
     weight_decay=weight_decay
     )
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.3, patience=8)
 
     writer = SummaryWriter(log_dir=output_dir / 'logs')
     logging.info(f"Hyperparameters: {locals()}")
@@ -241,6 +248,16 @@ def train_model(
 
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
+
+    #define loss function with Tversky
+    criterion = lambda inputs, targets, vm=None: focal_tversky_loss(
+        inputs, targets,
+        alpha=tv_alpha,
+        beta=tv_beta,
+        gamma=tv_gamma,
+        valid_mask=vm
+    )
+
 
     for epoch in range(1, epochs + 1):
         #model into training mode
@@ -270,15 +287,6 @@ def train_model(
                     # true_masks assumed [B,1,H,W] already
                 target_masks = true_masks.float()
 
-                
-                #define loss function with Tversky
-                criterion = lambda inputs, targets, vm=None: focal_tversky_loss(
-                    inputs, targets,
-                    alpha=tv_alpha,
-                    beta=tv_beta,
-                    valid_mask=vm
-                )
-                                
                 loss = criterion(masks_pred, target_masks, valid_mask)
                         
                 #clear previous gradients

@@ -128,7 +128,7 @@ def evaluate(net, dataloader, device, amp, criterion, n_classes):
 
             # Hard preds
             if n_classes == 1:
-                pred_pos = (torch.sigmoid(mask_pred).squeeze(1) > 0.5)   # [B,H,W] bool
+                pred_pos = (torch.sigmoid(mask_pred).squeeze(1) > 0.35)   # [B,H,W] bool
                 true_pos = (mask_true == 1)                              # flood is 1
 
                 if valid_mask is not None:
