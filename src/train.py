@@ -26,8 +26,9 @@ from UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
 
-# A common gamma default in medical imaging literature is 4/3 (approx 1.33).
-def focal_tversky_loss(inputs, targets, alpha, beta, gamma=0.75, valid_mask=None, epsilon=1e-6):
+# Standard focal-Tversky uses (1 - TI)^gamma. Keeping gamma at 4/3 preserves
+# the historical active-path loss curve after correcting gamma semantics.
+def focal_tversky_loss(inputs, targets, alpha, beta, gamma=4.0 / 3.0, valid_mask=None, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
 
@@ -66,13 +67,8 @@ def focal_tversky_loss(inputs, targets, alpha, beta, gamma=0.75, valid_mask=None
     focal_base = (1.0 - tversky_index).clamp(min=epsilon, max=1.0)
 
     
-    # CHANGE 2: Apply the focal transformation (1 - TI)^gamma before taking the mean.
-    # WHY: The standard Tversky loss is (1 - TI). By taking (1 - TI) and raising it 
-    # to the power of gamma, we squash the loss for "easy" predictions (where TI is close to 1) 
-    # to near zero. We must do this *before* the mean so the non-linear scaling applies 
-    # accurately to each individual class/image score.
-    # Standard focal Tversky: (1 - TI)^gamma
-    focal_tversky = focal_base.pow(1/gamma)
+    # Apply the standard focal-Tversky transform (1 - TI)^gamma before averaging.
+    focal_tversky = focal_base.pow(gamma)
 
     # 5. Average the focal scores across all classes and batches
     return focal_tversky.mean()
@@ -217,6 +213,63 @@ def finalize_metrics(state, n_classes):
 def should_save_checkpoint(epoch, epochs, save_every=50):
     return epoch == epochs or (save_every > 0 and epoch % save_every == 0)
 
+
+def active_dict_collate(batch):
+    if not batch:
+        raise ValueError("Empty batch")
+
+    images = torch.stack([b[0] for b in batch], dim=0)
+    masks = []
+    valid_masks = []
+    metas = []
+
+    for image, mask, meta in batch:
+        if mask is None:
+            raise ValueError("Active training requires labeled samples with masks.")
+        if mask.ndim != 3 or mask.shape[0] != 1:
+            raise ValueError(f"Active mask must have shape [1,H,W], got {tuple(mask.shape)}")
+
+        vm = meta.get("valid_mask", None)
+        if vm is None:
+            raise KeyError("Sample metadata is missing 'valid_mask'.")
+        if not isinstance(vm, torch.Tensor):
+            vm = torch.as_tensor(vm)
+        if vm.ndim == 3:
+            if vm.shape[0] != 1:
+                raise ValueError(f"valid_mask must have shape [H,W] or [1,H,W], got {tuple(vm.shape)}")
+            vm = vm.squeeze(0)
+        elif vm.ndim != 2:
+            raise ValueError(f"valid_mask must have shape [H,W] or [1,H,W], got {tuple(vm.shape)}")
+
+        expected_hw = tuple(image.shape[-2:])
+        if tuple(vm.shape) != expected_hw:
+            y0 = meta.get("patch_y0", None)
+            x0 = meta.get("patch_x0", None)
+            ps = meta.get("patch_size", None)
+            if y0 is None or x0 is None or ps is None:
+                raise ValueError(
+                    f"valid_mask shape mismatch without patch metadata: got {tuple(vm.shape)}, "
+                    f"expected {expected_hw}"
+                )
+            vm = vm[y0 : y0 + ps, x0 : x0 + ps]
+
+        if tuple(vm.shape) != expected_hw:
+            raise ValueError(
+                f"valid_mask shape mismatch after patch alignment: got {tuple(vm.shape)}, "
+                f"expected {expected_hw}"
+            )
+
+        masks.append(mask)
+        valid_masks.append(vm.to(dtype=torch.bool))
+        metas.append(dict(meta))
+
+    return {
+        'image': images,
+        'mask': torch.stack(masks, dim=0),
+        'valid_mask': torch.stack(valid_masks, dim=0),
+        'meta': metas,
+    }
+
 def train_model(
         model,
         device,
@@ -231,7 +284,7 @@ def train_model(
         gradient_clipping: float = 0.5,
         tv_alpha = 0.4, #confirm default for Tversky alpha
         tv_beta = 0.6, #confirm default for Tversky beta
-        tv_gamma= 0.75,
+        tv_gamma= 4.0 / 3.0,
         adam_betas = (0.9, 0.999),
         n_classes = 1
         ):
@@ -503,37 +556,13 @@ if __name__ == '__main__':
     dataset = base_dataset
     n_train = len(train_set)
 
-    def _dict_collate(batch):
-        images = torch.stack([b[0] for b in batch], dim=0)
-        masks = torch.stack([b[1] for b in batch], dim=0)
-        valid_masks = []
-        for b in batch:
-            meta = b[2]
-            vm = meta.get("valid_mask", None)
-            if vm is None:
-                raise KeyError("Sample metadata is missing 'valid_mask'.")
-            if not isinstance(vm, torch.Tensor):
-                vm = torch.as_tensor(vm)
-            if vm.shape[-2:] != b[0].shape[-2:]:
-                y0 = meta.get("patch_y0", None)
-                x0 = meta.get("patch_x0", None)
-                ps = meta.get("patch_size", None)
-                if y0 is not None and x0 is not None and ps is not None:
-                    if vm.ndim == 2:
-                        vm = vm[y0 : y0 + ps, x0 : x0 + ps]
-                    elif vm.ndim == 3:
-                        vm = vm[:, y0 : y0 + ps, x0 : x0 + ps]
-            valid_masks.append(vm)
-        valid_masks = torch.stack(valid_masks, dim=0)
-        return {'image': images, 'mask': masks, 'valid_mask': valid_masks}
-
     num_workers = getattr(args, 'num_workers', 0)
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=_dict_collate
+        collate_fn=active_dict_collate
     )
     val_loader = None
     if val_set is not None:
@@ -542,7 +571,7 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=_dict_collate
+            collate_fn=active_dict_collate
         )
     dir_checkpoint = output_dir / 'checkpoints'
     try:
