@@ -26,6 +26,29 @@ from UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
 
+DEFAULT_MASK_ID_SUFFIX_MAP = {
+    "S1Hand": "S1OtsuLabelHand",
+    "S1Weak": "S1OtsuLabelWeak",
+}
+
+
+def resolve_mask_id(image_id, mask_dir, mask_id_suffix_map):
+    direct_tif = mask_dir / f"{image_id}.tif"
+    direct_tiff = mask_dir / f"{image_id}.tiff"
+    if direct_tif.exists() or direct_tiff.exists():
+        return image_id
+
+    for img_suffix, mask_suffix in mask_id_suffix_map.items():
+        if image_id.endswith(img_suffix):
+            mask_id = f"{image_id[:-len(img_suffix)]}{mask_suffix}"
+            mask_tif = mask_dir / f"{mask_id}.tif"
+            mask_tiff = mask_dir / f"{mask_id}.tiff"
+            if mask_tif.exists() or mask_tiff.exists():
+                return mask_id
+
+    return None
+
+
 # Standard focal-Tversky uses (1 - TI)^gamma. Keeping gamma at 4/3 preserves
 # the historical active-path loss curve after correcting gamma semantics.
 def focal_tversky_loss(inputs, targets, alpha, beta, gamma=4.0 / 3.0, valid_mask=None, epsilon=1e-6):
@@ -534,22 +557,13 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     img_dir = Path(args.img_dir)
     mask_dir = Path(args.mask_dir)
-    mask_id_suffix_map = {'S1Hand': 'S1OtsuLabelHand', 'S1Weak': 'S1OtsuLabelWeak'}
+    mask_id_suffix_map = dict(DEFAULT_MASK_ID_SUFFIX_MAP)
     ids = list_ids_from_dir(args.img_dir, recursive=True)
     paired_ids_list = []
     missing_in_masks = 0
     for image_id in ids:
-        mask_id = image_id
-
-        #changes to work with different datasets
-        for img_suffix, mask_suffix in mask_id_suffix_map.items():                # ***
-            if image_id.endswith(img_suffix):                                     # ***
-                mask_id = f"{image_id[:-len(img_suffix)]}{mask_suffix}"           # ***
-                break
-
-        mask_tif = mask_dir / f"{mask_id}.tif"
-        mask_tiff = mask_dir / f"{mask_id}.tiff"
-        if mask_tif.exists() or mask_tiff.exists():
+        mask_id = resolve_mask_id(image_id, mask_dir, mask_id_suffix_map)
+        if mask_id is not None:
             paired_ids_list.append(image_id)
         else:
             missing_in_masks += 1
