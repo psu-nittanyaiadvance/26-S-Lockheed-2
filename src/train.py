@@ -308,6 +308,9 @@ def train_model(
     logging.info(f"Hyperparameters: {locals()}")
 
     
+    #variables to initialize best validation score tracking for checkpointing
+    best_val_iou = -1.0
+    best_epoch = -1
 
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
@@ -434,6 +437,19 @@ def train_model(
                 f"Recall: {last_val_score['val_flood_recall']:.4f} | "
                 f"F1: {last_val_score['val_flood_f1']:.4f}"
             )
+            # Check if this is the best validation score
+            current_val_score = last_val_score['val_flood_iou']
+            if current_val_score > best_val_iou:
+                best_val_iou = current_val_score
+                best_epoch = epoch
+                # Save best checkpoint
+                if save_checkpoint:
+                    Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                    state_dict = model.state_dict()
+                    state_dict['mask_values'] = dataset.mask_values
+                    torch.save(state_dict, str(dir_checkpoint / 'best_checkpoint.pth'))
+                    logging.info(f'Best checkpoint saved! (Epoch {epoch}, IoU: {best_val_iou:.4f})')
+
         else:
             print(
                 f"Epoch {epoch}/{epochs} complete:\n"
@@ -449,6 +465,10 @@ def train_model(
             if should_save_checkpoint(epoch, epochs):
                 torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
                 logging.info(f'Checkpoint {epoch} saved!')
+                
+    # Log best epoch at the end of training
+    if last_val_score is not None:
+        logging.info(f'Training completed. Best validation IoU: {best_val_iou:.4f} at epoch {best_epoch}')
 
 
 # This argparse block defines command-line options so you can run training with different
@@ -514,14 +534,19 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     img_dir = Path(args.img_dir)
     mask_dir = Path(args.mask_dir)
-    mask_id_suffix_map = {'S1Hand': 'S1OtsuLabelHand'}
+    mask_id_suffix_map = {'S1Hand': 'S1OtsuLabelHand', 'S1Weak': 'S1OtsuLabelWeak'}
     ids = list_ids_from_dir(args.img_dir, recursive=True)
     paired_ids_list = []
     missing_in_masks = 0
     for image_id in ids:
         mask_id = image_id
-        if image_id.endswith("S1Hand"):
-            mask_id = f"{image_id[:-len('S1Hand')]}S1OtsuLabelHand"
+
+        #changes to work with different datasets
+        for img_suffix, mask_suffix in mask_id_suffix_map.items():                # ***
+            if image_id.endswith(img_suffix):                                     # ***
+                mask_id = f"{image_id[:-len(img_suffix)]}{mask_suffix}"           # ***
+                break
+
         mask_tif = mask_dir / f"{mask_id}.tif"
         mask_tiff = mask_dir / f"{mask_id}.tiff"
         if mask_tif.exists() or mask_tiff.exists():
