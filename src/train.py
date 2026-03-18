@@ -27,7 +27,7 @@ from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sa
 
 
 DEFAULT_MASK_ID_SUFFIX_MAP = {
-    "S1Hand": "S1OtsuLabelHand",
+    "S1Hand": "LabelHand",
     "S1Weak": "S1OtsuLabelWeak",
 }
 
