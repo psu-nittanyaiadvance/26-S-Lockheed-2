@@ -45,3 +45,5 @@ experiments/
 .pytest_cache/
 .torch_cache/
 .tmp/
+
+test_results/

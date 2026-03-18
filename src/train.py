@@ -331,6 +331,9 @@ def train_model(
     logging.info(f"Hyperparameters: {locals()}")
 
     
+    #variables to initialize best validation score tracking for checkpointing
+    best_val_iou = -1.0
+    best_epoch = -1
 
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
@@ -457,6 +460,19 @@ def train_model(
                 f"Recall: {last_val_score['val_flood_recall']:.4f} | "
                 f"F1: {last_val_score['val_flood_f1']:.4f}"
             )
+            # Check if this is the best validation score
+            current_val_score = last_val_score['val_flood_iou']
+            if current_val_score > best_val_iou:
+                best_val_iou = current_val_score
+                best_epoch = epoch
+                # Save best checkpoint
+                if save_checkpoint:
+                    Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                    state_dict = model.state_dict()
+                    state_dict['mask_values'] = dataset.mask_values
+                    torch.save(state_dict, str(dir_checkpoint / 'best_checkpoint.pth'))
+                    logging.info(f'Best checkpoint saved! (Epoch {epoch}, IoU: {best_val_iou:.4f})')
+
         else:
             print(
                 f"Epoch {epoch}/{epochs} complete:\n"
@@ -472,6 +488,10 @@ def train_model(
             if should_save_checkpoint(epoch, epochs):
                 torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
                 logging.info(f'Checkpoint {epoch} saved!')
+                
+    # Log best epoch at the end of training
+    if last_val_score is not None:
+        logging.info(f'Training completed. Best validation IoU: {best_val_iou:.4f} at epoch {best_epoch}')
 
 
 # This argparse block defines command-line options so you can run training with different
