@@ -158,6 +158,7 @@ if __name__ == '__main__':
 
     global_step = 0 
 
+    model.eval()
     with torch.no_grad():
         for batch_idx, batch in enumerate(val_loader):
             # Move images to device

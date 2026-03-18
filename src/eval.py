@@ -78,6 +78,7 @@ def evaluate(net, dataloader, device, amp, criterion, n_classes):
     """
     require_active_binary_mode(n_classes, "evaluate()")
 
+    was_training = net.training
     net.eval()
     num_val_batches = len(dataloader)
     total_loss = 0.0
@@ -123,7 +124,8 @@ def evaluate(net, dataloader, device, amp, criterion, n_classes):
     miou = 0.5 * (flood_iou + land_iou)
     accuracy = (tp + tn) / (tp + tn + fp + fn + eps)
 
-    net.train()
+    if was_training:
+        net.train()
     return {
         "val_loss": total_loss / max(num_val_batches, 1),
         "val_accuracy": accuracy.item(),
