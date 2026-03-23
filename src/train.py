@@ -14,9 +14,8 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 from eval import evaluate
-from UNet import UNetModel
-
-dir_checkpoint = Path('./checkpoints/')
+from UNet.UNetModel import UNet as UNetModel
+from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
 def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
@@ -40,6 +39,151 @@ def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
     # 5. Average the scores across all classes and batches, then subtract from 1
     return 1 - tversky_index.mean()
 
+def _extract_ignore_mask(metas, device, masks):
+    if masks is None or metas is None:
+        return None
+    if len(metas) == 0:
+        return None
+    h, w = masks.shape[-2:]
+    ignore_masks = []
+    found_any = False
+    for meta in metas:
+        ignore = meta.get("ignore_mask", None)
+        if ignore is None:
+            ignore_masks.append(torch.zeros((1, h, w), dtype=torch.bool, device=device))
+            continue
+        found_any = True
+        if not isinstance(ignore, torch.Tensor):
+            ignore = torch.as_tensor(ignore)
+        if ignore.ndim == 2:
+            ignore = ignore.unsqueeze(0)
+        elif ignore.ndim != 3:
+            raise ValueError("ignore_mask must have shape [H,W] or [1,H,W]")
+        if ignore.shape[0] != 1:
+            raise ValueError("ignore_mask must have shape [1,H,W]")
+        if tuple(ignore.shape[-2:]) != (h, w):
+            raise ValueError(
+                f"ignore_mask spatial shape mismatch: got {tuple(ignore.shape[-2:])}, "
+                f"expected {(h, w)}"
+            )
+        ignore_masks.append(ignore.to(device=device, dtype=torch.bool))
+    if not found_any:
+        return None
+    return torch.stack(ignore_masks, dim=0)
+
+def _apply_ignore_index(targets, ignore_mask, ignore_index):
+    if ignore_mask is None:
+        return targets
+    if not isinstance(ignore_mask, torch.Tensor):
+        ignore_mask = torch.as_tensor(ignore_mask)
+    if ignore_mask.ndim == targets.ndim + 1:
+        ignore_mask = ignore_mask.squeeze(1)
+    if ignore_mask.shape != targets.shape:
+        raise ValueError(
+            f"ignore_mask shape mismatch: got {tuple(ignore_mask.shape)}, "
+            f"expected {tuple(targets.shape)}"
+        )
+    masked = targets.clone()
+    masked[ignore_mask.bool()] = ignore_index
+    return masked
+
+def init_metric_state(n_classes):
+    if n_classes == 1:
+        return {"tp": 0.0, "fp": 0.0, "fn": 0.0, "tn": 0.0, "n_classes": 1}
+    return {
+        "tp": [0.0] * n_classes,
+        "fp": [0.0] * n_classes,
+        "fn": [0.0] * n_classes,
+        "tn": [0.0] * n_classes,
+        "n_classes": n_classes,
+    }
+
+def update_metric_state(state, logits, masks, n_classes, ignore_mask=None):
+    if n_classes == 1:
+        if masks.ndim == 4 and masks.shape[1] == 1:
+            masks_bin = masks.squeeze(1)
+        else:
+            masks_bin = masks
+        probs = torch.sigmoid(logits)
+        if probs.ndim == 4 and probs.shape[1] == 1:
+            probs = probs.squeeze(1)
+        preds = (probs > 0.5)
+        valid = torch.ones_like(masks_bin, dtype=torch.bool)
+        if ignore_mask is not None:
+            if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
+                ignore_mask = ignore_mask.squeeze(1)
+            valid = ~ignore_mask.bool()
+        true = masks_bin.bool()
+        pred = preds.bool()
+        tp = (pred & true & valid).sum().item()
+        fp = (pred & ~true & valid).sum().item()
+        fn = (~pred & true & valid).sum().item()
+        tn = (~pred & ~true & valid).sum().item()
+        state["tp"] += tp
+        state["fp"] += fp
+        state["fn"] += fn
+        state["tn"] += tn
+        return
+
+    if masks.ndim == 4 and masks.shape[1] == 1:
+        true = masks.squeeze(1).long()
+    else:
+        true = masks.long()
+    pred = logits.argmax(dim=1)
+    valid = torch.ones_like(true, dtype=torch.bool)
+    if ignore_mask is not None:
+        if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
+            ignore_mask = ignore_mask.squeeze(1)
+        valid = ~ignore_mask.bool()
+    for cl in range(n_classes):
+        pred_cl = (pred == cl)
+        true_cl = (true == cl)
+        tp = (pred_cl & true_cl & valid).sum().item()
+        fp = (pred_cl & ~true_cl & valid).sum().item()
+        fn = (~pred_cl & true_cl & valid).sum().item()
+        tn = (~pred_cl & ~true_cl & valid).sum().item()
+        state["tp"][cl] += tp
+        state["fp"][cl] += fp
+        state["fn"][cl] += fn
+        state["tn"][cl] += tn
+
+def finalize_metrics(state, n_classes):
+    if n_classes == 1:
+        tp = state["tp"]
+        fp = state["fp"]
+        fn = state["fn"]
+        union = tp + fp + fn
+        if union == 0:
+            iou = float("nan")
+            dice = float("nan")
+        else:
+            iou = tp / union
+            denom = (2 * tp + fp + fn)
+            dice = float("nan") if denom == 0 else (2 * tp / denom)
+        return {"iou": iou, "dice": dice}
+
+    ious = []
+    dices = []
+    for cl in range(n_classes):
+        tp = state["tp"][cl]
+        fp = state["fp"][cl]
+        fn = state["fn"][cl]
+        union = tp + fp + fn
+        if union == 0:
+            iou = float("nan")
+            dice = float("nan")
+        else:
+            iou = tp / union
+            denom = (2 * tp + fp + fn)
+            dice = float("nan") if denom == 0 else (2 * tp / denom)
+        ious.append(iou)
+        dices.append(dice)
+    valid_ious = [v for v in ious if v == v]
+    valid_dices = [v for v in dices if v == v]
+    mean_iou = sum(valid_ious) / len(valid_ious) if valid_ious else float("nan")
+    mean_dice = sum(valid_dices) / len(valid_dices) if valid_dices else float("nan")
+    return {"iou": mean_iou, "dice": mean_dice, "iou_per_class": ious, "dice_per_class": dices}
+
 def train_model(
         model,
         device,
@@ -54,16 +198,19 @@ def train_model(
         gradient_clipping: float = 1.0,
         tv_alpha = 0.7, #confirm default for Tversky alpha
         tv_beta = 0.3, #confirm default for Tversky beta
-        adam_betas = (0.9, 0.999) 
+        adam_betas = (0.9, 0.999),
+        n_classes = 1
         ):
 
     #optimizer setup
-    optimizer = optim.Adam(
+    optimizer = optim.AdamW(
     model.parameters(), 
     lr=learning_rate, 
     betas=adam_betas, 
     weight_decay=weight_decay
     )
+
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
 
     writer = SummaryWriter(comment=f'LR_{learning_rate}_BS_{batch_size}')
     logging.info(f"Hyperparameters: {locals()}")
@@ -84,7 +231,7 @@ def train_model(
         #create progress bar as a 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as progress_bar:
             for batch in train_loader:
-                images, true_masks = batch['image'], batch['mask']
+                images, true_masks, valid_mask = batch['image'], batch['mask'], batch['valid_mask']
 
                 #check for correct dimensionality
                 assert images.shape[1] == model.n_channels, \
@@ -95,6 +242,7 @@ def train_model(
                 #format and load to device
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
                 true_masks = true_masks.to(device=device, dtype=torch.long)
+                valid_mask = valid_mask.to(device=device)
 
                 #forward pass
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
@@ -103,11 +251,15 @@ def train_model(
                     if model.n_classes == 1:
                         # Add a channel dimension to true_masks so it matches masks_pred shape [Batch, 1, Height, Width]
                         target_masks = true_masks.unsqueeze(1).float()
-                        loss = criterion(masks_pred, target_masks)
+                        loss_px = criterion(masks_pred, target_masks)
                     else:
                         # One-hot encode the target masks and rearrange dimensions to match masks_pred
                         target_masks = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
-                        loss = criterion(masks_pred, target_masks)
+                        loss_px = criterion(masks_pred, target_masks)
+                    vm = valid_mask
+                    if loss_px.ndim == 4 and vm.ndim == 3:
+                        vm = vm.unsqueeze(1)
+                    loss = (loss_px * vm).sum() / vm.sum().clamp(1)
                         
                 #clear previous gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -126,58 +278,52 @@ def train_model(
                 writer.add_scalar('Epoch', epoch, global_step)
                 progress_bar.set_postfix(**{'loss (batch)': loss.item()})
 
-                # --- Evaluation round (Local Logging & Scheduler Integration) ---
-                division_step = max(1, n_train // (5 * batch_size))
-                if division_step > 0 and global_step % division_step == 0:
-                    
-                    # 1. Weights and Gradients Health Check
-                    for tag, value in model.named_parameters():
-                        tag = tag.replace('/', '.')
-                        if not (torch.isinf(value) | torch.isnan(value)).any():
-                            writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
-                        if value.grad is not None:
-                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
+                # --- Evaluation round (Local Logging Version) ---
+                division_step = (n_train // (5 * batch_size))
+                if division_step > 0 and val_loader is not None:
+                    if global_step % division_step == 0:
+                        # 1. Log Weights and Gradients Histograms
+                        for tag, value in model.named_parameters():
+                            tag = tag.replace('/', '.')
+                            if not (torch.isinf(value) | torch.isnan(value)).any():
+                                writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
+                            if value.grad is not None:
+                                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                    writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
 
-                    # 2. Run Evaluation (Now returns a dictionary of metrics)
-                    # Note: pass model.n_classes so the function knows how to calculate IoU
-                    val_metrics = evaluate(model, val_loader, device, amp, criterion, model.n_classes)
+                        # 2. Run Evaluation
+                        val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
 
-                    # 3. Update the Scheduler
-                    # We use val_mIoU because it's the most stable indicator of model quality
-                    scheduler.step(val_metrics['val_mIoU'])
+                        # val_score is a dict from evaluate()
+                        for k, v in val_score.items():
+                            # TensorBoard expects numeric scalars; skip non-scalars defensively
+                            if isinstance(v, (int, float)):
+                                writer.add_scalar(f'Validation/{k}', v, global_step)
 
-                    # Get the current LR (in case the scheduler just dropped it)
-                    current_lr = optimizer.param_groups[0]['lr']
 
-                    logging.info(f'Step {global_step}: mIoU = {val_metrics["val_mIoU"]:.4f}, LR = {current_lr}')
+                                
+                        scheduler.step(val_score["miou"])
 
-                    # 4. Log Metrics and Visuals to TensorBoard
-                    try:
-                        # Log all scalar metrics from the dictionary
-                        for metric_name, value in val_metrics.items():
-                            writer.add_scalar(f'Metrics/{metric_name}', value, global_step)
                         
-                        # Log the current learning rate
-                        writer.add_scalar('Settings/Learning_Rate', current_lr, global_step)
-                        
-                        # Visual Comparison (Log the first image of the current batch)
-                        writer.add_image('Visuals/Image', images[0].cpu(), global_step)
-                        writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
-                        
-                        # Handle prediction visualization based on class count
-                        if model.n_classes == 1:
-                            # Binary: use sigmoid + threshold
-                            p_mask = (torch.sigmoid(masks_pred[0]) > 0.5).float().cpu()
-                        else:
-                            # Multiclass: take the highest probability class
-                            p_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
-                        
-                        writer.add_image('Visuals/Mask_Pred', p_mask, global_step)
 
-                    except Exception as e:
-                        logging.warning(f"Could not log to TensorBoard: {e}")
-
+                        # 3. Log Scalars and Images to TensorBoard
+                        try:
+                            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                            writer.add_scalar('Validation/Dice', val_score, global_step)
+                            
+                            # Log the first image in the batch
+                            # Note: TensorBoard expects (C, H, W)
+                            writer.add_image('Visuals/Image', images[0].cpu(), global_step)
+                            
+                            # Ground Truth Mask (adding channel dim)
+                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
+                            
+                            # Predicted Mask (taking argmax and adding channel dim)
+                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
+                            writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
+                        except Exception as e:
+                            logging.warning(f"Could not log to TensorBoard: {e}")
+        
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
@@ -203,6 +349,10 @@ def get_args():
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
     parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument('--img-dir', type=str, required=True, help='Path to SAR image .tif/.tiff files')
+    parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .tif/.tiff files')
+    parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
+    parser.add_argument('--seed', type=int, default=0, help='Random seed')
 
     return parser.parse_args()
 
@@ -215,7 +365,7 @@ if __name__ == '__main__':
     args = get_args()
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    model = UNetModel(n_channels=1, n_classes=args.classes, bilinear=args.bilinear)
+    model = UNetModel(n_channels=2, n_classes=args.classes, bilinear=args.bilinear)
     model = model.to(memory_format=torch.channels_last)
 
     logging.info(f'Network:\n'
@@ -230,6 +380,94 @@ if __name__ == '__main__':
         logging.info(f'Model loaded from {args.load}')
 
     model.to(device=device)
+    seed = getattr(args, 'seed', 0)
+    torch.manual_seed(seed)
+    img_dir = Path(args.img_dir)
+    mask_dir = Path(args.mask_dir)
+    mask_id_suffix_map = {'S1Hand': 'S1OtsuLabelHand'}
+    ids = list_ids_from_dir(args.img_dir, recursive=True)
+    paired_ids_list = []
+    missing_in_masks = 0
+    for image_id in ids:
+        mask_id = image_id
+        if image_id.endswith("S1Hand"):
+            mask_id = f"{image_id[:-len('S1Hand')]}S1OtsuLabelHand"
+        mask_tif = mask_dir / f"{mask_id}.tif"
+        mask_tiff = mask_dir / f"{mask_id}.tiff"
+        if mask_tif.exists() or mask_tiff.exists():
+            paired_ids_list.append(image_id)
+        else:
+            missing_in_masks += 1
+    logging.info(
+        "Paired ID report: images_total=%s paired_total=%s missing_in_masks=%s",
+        len(ids),
+        len(paired_ids_list),
+        missing_in_masks,
+    )
+    if len(paired_ids_list) == 0:
+        raise ValueError("No paired image/mask IDs found; aborting training.")
+    base_dataset = SARDataset(
+        img_root=img_dir,
+        mask_root=mask_dir,
+        ids_or_paths=paired_ids_list,
+        mode='strong',
+        mask_id_suffix_map=mask_id_suffix_map,
+        expected_img_bands=2,
+    )
+    base_dataset.mask_values = [0, 1]
+    validate_sample_shapes(base_dataset, n=64)
+    val_percent = args.val / 100
+    n_val = int(len(base_dataset) * val_percent)
+    n_train = len(base_dataset) - n_val
+    generator = torch.Generator().manual_seed(seed)
+    train_base, val_base = random_split(base_dataset, [n_train, n_val], generator=generator)
+    train_set = PatchDataset(train_base, patch_size=256, overlap=0.2)
+    val_set = PatchDataset(val_base, patch_size=256, overlap=0.2) if n_val > 0 else None
+    dataset = base_dataset
+    n_train = len(train_set)
+
+    def _dict_collate(batch):
+        images = torch.stack([b[0] for b in batch], dim=0)
+        masks = torch.stack([b[1] for b in batch], dim=0)
+        valid_masks = []
+        for b in batch:
+            meta = b[2]
+            vm = meta.get("valid_mask", None)
+            if vm is None:
+                raise KeyError("Sample metadata is missing 'valid_mask'.")
+            if not isinstance(vm, torch.Tensor):
+                vm = torch.as_tensor(vm)
+            if vm.shape[-2:] != b[0].shape[-2:]:
+                y0 = meta.get("patch_y0", None)
+                x0 = meta.get("patch_x0", None)
+                ps = meta.get("patch_size", None)
+                if y0 is not None and x0 is not None and ps is not None:
+                    if vm.ndim == 2:
+                        vm = vm[y0 : y0 + ps, x0 : x0 + ps]
+                    elif vm.ndim == 3:
+                        vm = vm[:, y0 : y0 + ps, x0 : x0 + ps]
+            valid_masks.append(vm)
+        valid_masks = torch.stack(valid_masks, dim=0)
+        return {'image': images, 'mask': masks, 'valid_mask': valid_masks}
+
+    num_workers = getattr(args, 'num_workers', 0)
+    train_loader = DataLoader(
+        train_set,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=num_workers,
+        collate_fn=_dict_collate
+    )
+    val_loader = None
+    if val_set is not None:
+        val_loader = DataLoader(
+            val_set,
+            batch_size=args.batch_size,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=_dict_collate
+        )
+    dir_checkpoint = Path('checkpoints')
     try:
         train_model(
             model=model,
@@ -239,7 +477,8 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            n_classes=args.classes
         )
     except torch.cuda.OutOfMemoryError:
         logging.error('Detected OutOfMemoryError! '
@@ -255,5 +494,6 @@ if __name__ == '__main__':
             device=device,
             img_scale=args.scale,
             val_percent=args.val / 100,
-            amp=args.amp
+            amp=args.amp,
+            n_classes=args.classes
         )

@@ -1,1 +1,13 @@
-# Dependencies will be added later.
+# Core ML + IO
+numpy
+torch
+torchvision
+tensorboard
+rasterio
+
+# Notebook analysis/plotting
+matplotlib
+pandas
+
+# Utilities
+tqdm
