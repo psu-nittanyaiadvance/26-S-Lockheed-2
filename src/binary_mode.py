@@ -1,7 +1,7 @@
 import torch
 
 
-ACTIVE_BINARY_METRIC_THRESHOLD = 0.6
+ACTIVE_BINARY_METRIC_THRESHOLD = 0.5
 
 
 def require_active_binary_mode(n_classes, context):
