@@ -230,6 +230,11 @@ class SARDataset(Dataset):
         return tif
 
     def _resolve_mask_id(self, sample_id: str) -> str:
+        if self.mask_root is not None:
+            direct_tif = self.mask_root / f"{sample_id}.tif"
+            direct_tiff = self.mask_root / f"{sample_id}.tiff"
+            if direct_tif.exists() or direct_tiff.exists():
+                return sample_id
         if not self.mask_id_suffix_map:
             return sample_id
         for img_suffix, mask_suffix in self.mask_id_suffix_map.items():
