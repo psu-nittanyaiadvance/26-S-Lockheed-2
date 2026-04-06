@@ -229,6 +229,11 @@ class OpticalDataset(Dataset):
         return tif
 
     def _resolve_mask_id(self, sample_id: str) -> str:
+        if self.mask_root is not None:
+            direct_tif = self.mask_root / f"{sample_id}.tif"
+            direct_tiff = self.mask_root / f"{sample_id}.tiff"
+            if direct_tif.exists() or direct_tiff.exists():
+                return sample_id
         if not self.mask_id_suffix_map:
             return sample_id
         for img_suffix, mask_suffix in self.mask_id_suffix_map.items():
@@ -458,15 +463,24 @@ class OpticalDataset(Dataset):
         mask_path = sample["mask_path"]
 
         img, valid_mask = self._load_image(img_path, sample_id)
-        img_tensor = torch.from_numpy(img).float()
-        valid_mask_tensor = torch.from_numpy(valid_mask)  # bool [H, W]
+        if not np.isfinite(img).all():
+            raise ValueError(
+                f"Optical image contains NaN/Inf after preprocessing for id '{sample_id}'"
+            )
+        if valid_mask.ndim != 2:
+            raise ValueError(
+                f"valid_mask must have shape [H, W] for id '{sample_id}', got {valid_mask.shape}"
+            )
+
+        img_tensor = torch.from_numpy(img).to(dtype=torch.float32)
+        valid_mask_tensor = torch.from_numpy(valid_mask).to(dtype=torch.bool)  # [H, W]
 
         mask_tensor: Optional[torch.Tensor] = None
         if self.mode != "none":
             if mask_path is None:
                 raise RuntimeError(f"Missing mask path for id '{sample_id}'")
             mask_np = self._load_mask(mask_path, (img.shape[1], img.shape[2]), sample_id)
-            mask_tensor = torch.from_numpy(mask_np)
+            mask_tensor = torch.from_numpy(mask_np).to(dtype=torch.uint8)
 
         metadata: Dict[str, Any] = {
             "id": sample_id,

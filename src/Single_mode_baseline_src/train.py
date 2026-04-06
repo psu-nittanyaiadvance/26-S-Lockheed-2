@@ -335,6 +335,8 @@ def train_model(
     best_val_iou = -1.0
     best_epoch = -1
 
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
+
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
 
@@ -504,7 +506,7 @@ def get_args():
     parser.add_argument('--batch-size', '-b', dest='batch_size', metavar='B', type=int, default=1, help='Batch size')
     parser.add_argument('--learning-rate', '-l', metavar='LR', type=float, default=1e-5,
                         help='Learning rate', dest='lr')
-    parser.add_argument('--load', '-f', type=str, default=False, help='Load model from a .pth file')
+    parser.add_argument('--load', '-f', type=str, default=None, help='Load model from a .pth file')
     parser.add_argument('--scale', '-s', type=float, default=0.5, help='Downscaling factor of the images')
     parser.add_argument('--validation', '-v', dest='val', type=float, default=10.0,
                         help='Percent of the data that is used as validation (0-100)')
@@ -529,6 +531,8 @@ def get_args():
 
 #argparse usage in main
 if __name__ == '__main__':
+    logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
+
     args = get_args()
     require_active_binary_mode(args.classes, "train.py")
 
