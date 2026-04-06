@@ -14,6 +14,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from data_loader import FusedDataset, default_collate  # noqa: E402
 
 EXAMPLE_PATH = ROOT / "src" / "data_loader" / "example_optical_fused.py"
+README_PATH = ROOT / "src" / "data_loader" / "README.md"
 
 
 class _TupleDataset(Dataset):
@@ -83,3 +84,19 @@ def test_example_direct_fused_getitem_unpack_matches_dataset_contract() -> None:
     fused = FusedDataset(sar_ds, opt_ds)
 
     assert len(fused[0]) == 3
+
+
+def test_example_points_strict_fusion_to_combined_manifest_path() -> None:
+    text = EXAMPLE_PATH.read_text(encoding="utf-8")
+
+    assert "FusedDataset.from_combined_manifest" in text
+    assert "Combined/manifest.csv" in text
+    assert "not strict paired multimodal training" in text
+
+
+def test_readme_documents_strict_combined_manifest_usage() -> None:
+    text = README_PATH.read_text(encoding="utf-8")
+
+    assert "FusedDataset.from_combined_manifest" in text
+    assert "Membership comes from `Combined/manifest.csv`" in text
+    assert "Do not treat raw `S1Hand` / `S2Hand` directory pairing as equivalent" in text

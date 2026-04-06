@@ -4,14 +4,18 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Sequence, Tuple
 
+import numpy as np
 import pytest
+import rasterio
 import torch
+from rasterio.transform import from_origin
 from torch.utils.data import Dataset
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from data_loader import FusedDataset  # noqa: E402
+from data_loader import FusedDataset, PatchDataset  # noqa: E402
+from data_loader.combined_manifest import CombinedManifestSample  # noqa: E402
 
 
 class _TupleDataset(Dataset):
@@ -66,6 +70,71 @@ def _make_item(
     if modality is not None:
         meta["modality"] = modality
     return img, mask, meta
+
+
+def _write_tif(path: Path, data: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if data.ndim == 2:
+        data = data[None, :, :]
+    count, height, width = data.shape
+    with rasterio.open(
+        path,
+        "w",
+        driver="GTiff",
+        height=height,
+        width=width,
+        count=count,
+        dtype=data.dtype,
+        transform=from_origin(0, 0, 1, 1),
+    ) as dst:
+        dst.write(data)
+
+
+def _build_combined_root(
+    tmp_path: Path,
+    *,
+    manifest_rows: Sequence[Dict[str, str]],
+    sar_shape: Tuple[int, int] = (4, 4),
+    optical_shape: Tuple[int, int] = (4, 4),
+    include_labels: bool = True,
+    missing_assets: Optional[set[Tuple[str, str]]] = None,
+    optical_value: int = 2500,
+) -> Path:
+    combined_root = tmp_path / "Combined"
+    missing_assets = missing_assets or set()
+
+    for row in manifest_rows:
+        sample_id = row["sample_id"]
+        if ("S1", sample_id) not in missing_assets:
+            _write_tif(
+                combined_root / "S1" / f"{sample_id}.tif",
+                np.ones((2, *sar_shape), dtype=np.float32),
+            )
+        if ("S2", sample_id) not in missing_assets:
+            _write_tif(
+                combined_root / "S2" / f"{sample_id}.tif",
+                np.full((3, *optical_shape), optical_value, dtype=np.uint16),
+            )
+        if include_labels and ("Label", sample_id) not in missing_assets:
+            _write_tif(
+                combined_root / "Label" / f"{sample_id}.tif",
+                np.ones(sar_shape, dtype=np.uint8),
+            )
+
+    header = [
+        "sample_id",
+        "output_S1",
+        "output_S2",
+        "output_Label",
+    ]
+    lines = [",".join(header)]
+    for row in manifest_rows:
+        values = [row.get(column, "") for column in header]
+        lines.append(",".join(values))
+    manifest_path = combined_root / "manifest.csv"
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    manifest_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return combined_root
 
 
 def test_len_matches_sar_dataset() -> None:
@@ -249,3 +318,260 @@ def test_sar_only_is_behaviorally_identical_to_zeros_alias() -> None:
     assert zeros_meta["optical_img_path"] == sar_only_meta["optical_img_path"]
     assert zeros_ds.optical_missing_policy == "zeros"
     assert sar_only_ds.optical_missing_policy == "zeros"
+
+
+def test_strict_from_combined_manifest_preserves_manifest_order_not_directory_order(
+    tmp_path: Path,
+) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_b",
+                "output_S1": "S1\\tile_b.tif",
+                "output_S2": "S2\\tile_b.tif",
+                "output_Label": "Label\\tile_b.tif",
+            },
+            {
+                "sample_id": "tile_a",
+                "output_S1": "S1\\tile_a.tif",
+                "output_S2": "S2\\tile_a.tif",
+                "output_Label": "Label\\tile_a.tif",
+            },
+        ],
+    )
+
+    fused = FusedDataset.from_combined_manifest(combined_root, mode="none")
+
+    assert [sample["id"] for sample in fused.sar_dataset.samples] == ["tile_b", "tile_a"]
+    assert [sample["id"] for sample in fused.optical_dataset.samples] == ["tile_b", "tile_a"]
+    assert [fused[i][2]["id"] for i in range(len(fused))] == ["tile_b", "tile_a"]
+
+
+def test_strict_from_combined_manifest_enforces_exact_parity_and_metadata(
+    tmp_path: Path,
+) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_1",
+                "output_S1": "S1\\tile_1.tif",
+                "output_S2": "S2\\tile_1.tif",
+                "output_Label": "Label\\tile_1.tif",
+            },
+            {
+                "sample_id": "tile_2",
+                "output_S1": "S1\\tile_2.tif",
+                "output_S2": "S2\\tile_2.tif",
+                "output_Label": "Label\\tile_2.tif",
+            },
+        ],
+    )
+
+    fused = FusedDataset.from_combined_manifest(combined_root, mode="none")
+    _img, mask, meta = fused[1]
+
+    sar_ids = [sample["id"] for sample in fused.sar_dataset.samples]
+    optical_ids = [sample["id"] for sample in fused.optical_dataset.samples]
+
+    assert len(sar_ids) == len(optical_ids) == len(fused) == 2
+    assert sar_ids == optical_ids == ["tile_1", "tile_2"]
+    assert mask is None
+    assert meta["paired_sample_id"] == "tile_2"
+    assert meta["strict_paired_mode"] is True
+    assert meta["pairing_source"] == "combined_manifest"
+    assert Path(meta["sar_img_path"]).name == "tile_2.tif"
+    assert Path(meta["optical_img_path"]).name == "tile_2.tif"
+    assert meta["manifest_row_index"] == 1
+
+
+def test_strict_from_combined_manifest_requires_optical_assets(tmp_path: Path) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_1",
+                "output_S1": "S1\\tile_1.tif",
+                "output_S2": "S2\\tile_1.tif",
+                "output_Label": "Label\\tile_1.tif",
+            }
+        ],
+        missing_assets={("S2", "tile_1")},
+    )
+
+    with pytest.raises(FileNotFoundError, match="missing output_S2 asset"):
+        FusedDataset.from_combined_manifest(combined_root, mode="none")
+
+
+def test_strict_from_combined_manifest_requires_manifest_columns(tmp_path: Path) -> None:
+    combined_root = tmp_path / "Combined"
+    combined_root.mkdir(parents=True, exist_ok=True)
+    (combined_root / "manifest.csv").write_text(
+        "sample_id,output_S1\n"
+        "tile_1,S1\\\\tile_1.tif\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="missing required columns"):
+        FusedDataset.from_combined_manifest(combined_root, mode="none")
+
+
+def test_strict_from_combined_manifest_rejects_independent_validate_flags(
+    tmp_path: Path,
+) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_1",
+                "output_S1": "S1\\tile_1.tif",
+                "output_S2": "S2\\tile_1.tif",
+                "output_Label": "Label\\tile_1.tif",
+            }
+        ],
+    )
+
+    with pytest.raises(ValueError, match="validates jointly"):
+        FusedDataset.from_combined_manifest(
+            combined_root,
+            mode="none",
+            optical_dataset_kwargs={"validate": False},
+        )
+
+
+def test_direct_strict_pairing_rejects_zero_fallback_policy() -> None:
+    sar_ds = _TupleDataset([_make_item("tile", channels=2)])
+    opt_ds = _TupleDataset([_make_item("tile", channels=3, modality="optical")])
+    strict_manifest_samples = [
+        CombinedManifestSample(
+            sample_id="tile",
+            manifest_index=0,
+            manifest_path="Combined/manifest.csv",
+            sar_path="Combined/S1/tile.tif",
+            optical_path="Combined/S2/tile.tif",
+            label_path=None,
+        )
+    ]
+
+    with pytest.raises(ValueError, match="requires optical_missing_policy='raise'"):
+        FusedDataset(
+            sar_ds,
+            opt_ds,
+            optical_missing_policy="zeros",
+            strict_pairing=True,
+            strict_manifest_samples=strict_manifest_samples,
+        )
+
+
+def test_strict_from_combined_manifest_validation_raises_instead_of_silent_drift(
+    tmp_path: Path,
+) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_bad",
+                "output_S1": "S1\\tile_bad.tif",
+                "output_S2": "S2\\tile_bad.tif",
+                "output_Label": "Label\\tile_bad.tif",
+            }
+        ],
+        sar_shape=(4, 4),
+        optical_shape=(5, 4),
+    )
+
+    with pytest.raises(ValueError, match="mismatched spatial dims"):
+        FusedDataset.from_combined_manifest(
+            combined_root,
+            mode="none",
+            validate=True,
+        )
+
+
+def test_strict_valid_mask_is_joint_intersection_when_both_modalities_exist() -> None:
+    sar_valid = torch.tensor([[True, True], [False, True]])
+    opt_valid = torch.tensor([[True, False], [True, True]])
+    strict_manifest_samples = [
+        CombinedManifestSample(
+            sample_id="tile",
+            manifest_index=0,
+            manifest_path="Combined/manifest.csv",
+            sar_path="Combined/S1/tile.tif",
+            optical_path="Combined/S2/tile.tif",
+            label_path=None,
+        )
+    ]
+    sar_img, sar_mask, sar_meta = _make_item("tile", channels=2, valid_mask=sar_valid)
+    sar_meta["img_path"] = "Combined/S1/tile.tif"
+    opt_img, opt_mask, opt_meta = _make_item(
+        "tile",
+        channels=3,
+        valid_mask=opt_valid,
+        modality="optical",
+    )
+    opt_meta["img_path"] = "Combined/S2/tile.tif"
+    sar_ds = _TupleDataset([(sar_img, sar_mask, sar_meta)])
+    opt_ds = _TupleDataset([(opt_img, opt_mask, opt_meta)])
+
+    fused = FusedDataset(
+        sar_ds,
+        opt_ds,
+        strict_pairing=True,
+        strict_manifest_samples=strict_manifest_samples,
+    )
+    _img, _mask, meta = fused[0]
+
+    assert meta["strict_paired_mode"] is True
+    assert torch.equal(meta["valid_mask"], sar_valid & opt_valid)
+
+
+def test_strict_from_combined_manifest_supports_unlabeled_mode(tmp_path: Path) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_1",
+                "output_S1": "S1\\tile_1.tif",
+                "output_S2": "S2\\tile_1.tif",
+                "output_Label": "Label\\tile_1.tif",
+            }
+        ],
+    )
+
+    fused = FusedDataset.from_combined_manifest(combined_root, mode="none")
+    img, mask, meta = fused[0]
+
+    assert mask is None
+    assert img.shape[0] == meta["n_sar_bands"] + meta["n_optical_bands"]
+    assert meta["strict_paired_mode"] is True
+    assert meta["fused_optical_available"] is True
+
+
+def test_strict_patched_fused_samples_keep_deterministic_patch_provenance(
+    tmp_path: Path,
+) -> None:
+    combined_root = _build_combined_root(
+        tmp_path,
+        manifest_rows=[
+            {
+                "sample_id": "tile_1",
+                "output_S1": "S1\\tile_1.tif",
+                "output_S2": "S2\\tile_1.tif",
+                "output_Label": "Label\\tile_1.tif",
+            }
+        ],
+    )
+
+    fused = FusedDataset.from_combined_manifest(combined_root, mode="none")
+    patched = PatchDataset(fused, patch_size=2, overlap=0.0)
+    _img, mask, meta = patched[0]
+
+    assert mask is None
+    assert meta["base_id"] == "tile_1"
+    assert meta["id"] == "tile_1_r0_c0"
+    assert meta["strict_paired_mode"] is True
+    assert meta["paired_sample_id"] == "tile_1"
+    assert Path(meta["sar_img_path"]).name == "tile_1.tif"
+    assert Path(meta["optical_img_path"]).name == "tile_1.tif"
+    assert tuple(meta["valid_mask"].shape) == (2, 2)

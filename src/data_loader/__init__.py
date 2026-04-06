@@ -1,3 +1,4 @@
+from .combined_manifest import load_combined_manifest_samples
 from .sar_dataset import SARDataset
 from .optical_dataset import OpticalDataset
 from .fused_dataset import FusedDataset
@@ -14,6 +15,7 @@ __all__ = [
     "OpticalDataset",
     "FusedDataset",
     "PatchDataset",
+    "load_combined_manifest_samples",
     # Splits
     "make_split",
     # Stats

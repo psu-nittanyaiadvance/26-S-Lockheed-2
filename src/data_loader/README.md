@@ -1,85 +1,74 @@
-# Data Loader (src/data_loader)
+# Data Loader
 
-This folder contains the SAR-only dataset and utilities used by the baseline.
-All samples are ground-truth masks (strong or weak labels).
+`src/data_loader` contains the dataset stack used for SAR, optical, fused, and
+patch-based training.
 
-**Core Dataset: `SARDataset`**
+## Core datasets
 
-`SARDataset` returns `(image, mask, metadata)`:
-- `image`: `torch.float32` with shape `[C, H, W]` read via rasterio.
-- `mask`: `torch.uint8` with shape `[1, H, W]` (binary).
-- `metadata`: dict with `id`, `img_path`, `mask_path`, and `ignore_mask`.
+`SARDataset`
+- Returns `(image, mask, metadata)`.
+- Supports `mode="strong"`, `"weak"`, or `"none"`.
+- `metadata` includes `id`, `img_path`, `mask_path`, and `valid_mask`.
 
-Notes:
-- `mode` must be `strong` or `weak` (masks are always required).
-- If `ids_are_paths=False`, pass stems in `ids_or_paths` and set `img_root`.
-- If `ids_are_paths=True`, pass `.tif/.tiff` paths and set `mask_root`.
-- `mask_id_suffix_map` can map image IDs to mask IDs when filenames differ.
-- `normalize_cfg` supports `"none"` or `{"type": "zscore", "mean": ..., "std": ...}`.
+`OpticalDataset`
+- Mirrors the same dataset contract for Sentinel-2 tiles.
+- Supports band selection, optional cloud masking, and the same `valid_mask`
+  semantics.
 
-**Patching**
+`FusedDataset`
+- Concatenates SAR and optical channels in `[C_sar + C_s2, H, W]`.
+- Returns the SAR mask when labels are present.
+- Legacy direct construction still pairs by sample ID and may use
+  `optical_missing_policy="zeros"` for ad hoc experiments.
 
-Use `PatchDataset` (or `SARDataset.with_patches`) to generate overlapping
-256×256 patches with 20% overlap (stride computed in `PatchDataset`).
+## Strict paired fusion
 
-**Utilities**
-
-- `list_ids_from_dir(img_root)`: sorted stems for `.tif/.tiff` files.
-- `paired_ids(img_root, mask_root)`: intersection of image/mask IDs.
-- `make_split(ids, val_frac, seed)`: deterministic split helper.
-- `compute_running_mean_std(dataset, max_samples=None)`: streaming stats.
-- `validate_sample_shapes(ds, n=64)`: checks image/mask shapes and dtypes.
-
-**Usage Example**
+For multimodal unlabeled pretraining, use:
 
 ```python
 from pathlib import Path
-from torch.utils.data import DataLoader
 
-from src.data_loader import (
-    PatchDataset,
-    SARDataset,
-    compute_running_mean_std,
-    default_collate,
-    make_split,
+from data_loader import FusedDataset
+
+fused_ds = FusedDataset.from_combined_manifest(
+    Path("datasets/FilteredSouthAsia/Combined"),
+    mode="none",
+    sar_dataset_kwargs={
+        "normalize_cfg": "none",
+        "log_transform": True,
+    },
+    optical_dataset_kwargs={
+        "s2_bands": [0, 1, 2, 3],
+        "normalize_cfg": "none",
+    },
 )
-
-img_root = Path("datasets/FilteredSouthAsia/HandLabeled/S1Hand")
-mask_root = Path("datasets/FilteredSouthAsia/HandLabeled/LabelHand")
-
-ids = ["tile_000123", "tile_000124", "tile_000125", "tile_000126"]
-train_ids, val_ids = make_split(ids, val_frac=0.2, seed=1337)
-
-train_raw = SARDataset(
-    img_root=img_root,
-    mask_root=mask_root,
-    ids_or_paths=train_ids,
-    mode="strong",
-    normalize_cfg="none",
-    log_transform=True,
-)
-
-mean, std = compute_running_mean_std(train_raw, max_samples=512)
-
-train_ds = SARDataset(
-    img_root=img_root,
-    mask_root=mask_root,
-    ids_or_paths=train_ids,
-    mode="strong",
-    normalize_cfg={"type": "zscore", "mean": mean, "std": std},
-    log_transform=True,
-)
-
-patch_ds = PatchDataset(train_ds, patch_size=256, overlap=0.2)
-
-train_loader = DataLoader(
-    patch_ds,
-    batch_size=4,
-    shuffle=True,
-    num_workers=0,
-    collate_fn=default_collate,
-)
-
-images, masks, metas = next(iter(train_loader))
-print(images.shape, masks.shape, metas[0]["id"])
 ```
+
+Strict paired mode guarantees:
+- Membership comes from `Combined/manifest.csv`, not directory globbing.
+- Sample order matches manifest row order exactly.
+- Every sample has one SAR tile and one optical tile with the same canonical
+  `sample_id`.
+- Missing optical fallback is not allowed.
+- Validation is joint/assertive rather than silently dropping one modality.
+- Metadata preserves canonical provenance (`id`, `sar_img_path`,
+  `optical_img_path`, `manifest_row_index`, `strict_paired_mode`).
+
+Do not treat raw `S1Hand` / `S2Hand` directory pairing as equivalent to strict
+paired mode. Those roots are useful for legacy or modality-specific workflows,
+but strict multimodal fusion should be built from `Combined`.
+
+## Patching
+
+Wrap any base dataset with `PatchDataset` to create deterministic overlapping
+patches while preserving provenance in metadata (`base_id`, `patch_row`,
+`patch_col`, `patch_y0`, `patch_x0`, `patch_size`).
+
+## Utilities
+
+- `load_combined_manifest_samples(...)`: ordered canonical strict-pair manifest
+  reader.
+- `make_split(ids, val_frac, seed)`: deterministic split helper.
+- `compute_running_mean_std(dataset, max_samples=None)`: streaming stats.
+- `default_collate(...)`: collate function that keeps metadata aligned.
+- `validate_sample_shapes(ds, n=64)`: quick shape/dtype sanity checks.

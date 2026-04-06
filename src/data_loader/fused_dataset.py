@@ -21,10 +21,19 @@ Missing optical handling:
 
 from __future__ import annotations
 
-from typing import Any, Dict, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import torch
 from torch.utils.data import Dataset
+
+from .combined_manifest import (
+    CombinedManifestSample,
+    load_combined_manifest_samples,
+    validate_combined_manifest_samples,
+)
+from .optical_dataset import OpticalDataset
+from .sar_dataset import SARDataset
 
 
 class FusedDataset(Dataset):
@@ -55,6 +64,9 @@ class FusedDataset(Dataset):
         optical_dataset: Dataset,
         optical_missing_policy: str = "raise",
         require_spatial_match: bool = True,
+        *,
+        strict_pairing: bool = False,
+        strict_manifest_samples: Optional[Sequence[CombinedManifestSample]] = None,
     ) -> None:
         if optical_missing_policy not in {"zeros", "sar_only", "raise"}:
             raise ValueError(
@@ -71,6 +83,8 @@ class FusedDataset(Dataset):
         self.optical_dataset = optical_dataset
         self.optical_missing_policy = optical_missing_policy
         self.require_spatial_match = require_spatial_match
+        self.strict_pairing = bool(strict_pairing)
+        self._strict_manifest_samples = list(strict_manifest_samples or [])
 
         self._optical_id_to_idx: Dict[str, int] = {}
         for i in range(len(optical_dataset)):  # type: ignore[arg-type]
@@ -84,7 +98,13 @@ class FusedDataset(Dataset):
 
         self._n_optical_bands = self._infer_optical_bands()
 
-        if self.optical_missing_policy == "raise":
+        if self.strict_pairing:
+            if self.optical_missing_policy != "raise":
+                raise ValueError(
+                    "strict paired mode requires optical_missing_policy='raise'"
+                )
+            self._assert_strict_pairing()
+        elif self.optical_missing_policy == "raise":
             sar_samples = getattr(sar_dataset, "samples", None)
             if sar_samples is not None:
                 missing = [
@@ -97,6 +117,78 @@ class FusedDataset(Dataset):
                         f"optical_missing_policy='raise' but {len(missing)} SAR IDs "
                         f"have no paired optical tile. First few: {missing[:5]}"
                     )
+
+    @classmethod
+    def from_combined_manifest(
+        cls,
+        combined_root: str | Path = "datasets/FilteredSouthAsia/Combined",
+        *,
+        mode: str = "none",
+        sar_dataset_kwargs: Optional[Dict[str, Any]] = None,
+        optical_dataset_kwargs: Optional[Dict[str, Any]] = None,
+        require_spatial_match: bool = True,
+        validate: bool = True,
+    ) -> "FusedDataset":
+        """
+        Build a strict manifest-backed fused dataset from Combined/manifest.csv.
+
+        Canonical membership and ordering come only from manifest row order.
+        Missing SAR/optical assets are rejected before dataset construction.
+        """
+        sar_dataset_kwargs = dict(sar_dataset_kwargs or {})
+        optical_dataset_kwargs = dict(optical_dataset_kwargs or {})
+
+        cls._reject_strict_dataset_overrides(
+            sar_dataset_kwargs,
+            dataset_name="sar_dataset_kwargs",
+        )
+        cls._reject_strict_dataset_overrides(
+            optical_dataset_kwargs,
+            dataset_name="optical_dataset_kwargs",
+        )
+
+        samples = load_combined_manifest_samples(
+            combined_root,
+            require_label=mode != "none",
+        )
+        if validate:
+            validate_combined_manifest_samples(
+                samples,
+                require_spatial_match=require_spatial_match,
+                require_label=mode != "none",
+            )
+
+        combined_root = Path(combined_root)
+        if combined_root.name.lower() == "manifest.csv":
+            combined_root = combined_root.parent
+
+        sar_dataset = SARDataset(
+            img_root=None,
+            mask_root=(combined_root / "Label") if mode != "none" else None,
+            ids_or_paths=[sample.sar_path for sample in samples],
+            mode=mode,
+            ids_are_paths=True,
+            validate=False,
+            **sar_dataset_kwargs,
+        )
+        optical_dataset = OpticalDataset(
+            img_root=None,
+            mask_root=None,
+            ids_or_paths=[sample.optical_path for sample in samples],
+            mode="none",
+            ids_are_paths=True,
+            validate=False,
+            **optical_dataset_kwargs,
+        )
+
+        return cls(
+            sar_dataset=sar_dataset,
+            optical_dataset=optical_dataset,
+            optical_missing_policy="raise",
+            require_spatial_match=require_spatial_match,
+            strict_pairing=True,
+            strict_manifest_samples=samples,
+        )
 
     def __len__(self) -> int:
         return len(self.sar_dataset)  # type: ignore[arg-type]
@@ -157,6 +249,7 @@ class FusedDataset(Dataset):
         metadata = dict(sar_meta)
         metadata["id"] = sample_id
         metadata["img_path"] = sar_meta.get("img_path")
+        metadata["sar_img_path"] = sar_meta.get("img_path")
         metadata["mask_path"] = sar_meta.get("mask_path")
         metadata["valid_mask"] = fused_valid
         metadata["modality"] = "fused"
@@ -164,8 +257,87 @@ class FusedDataset(Dataset):
         metadata["fused_optical_available"] = optical_available
         metadata["n_sar_bands"] = sar_img.shape[0]
         metadata["n_optical_bands"] = opt_img.shape[0]
+        metadata["paired_sample_id"] = sample_id
+        metadata["strict_paired_mode"] = self.strict_pairing
+        metadata["pairing_source"] = (
+            "combined_manifest" if self.strict_pairing else "id_lookup"
+        )
+        if self.strict_pairing:
+            strict_sample = self._strict_manifest_samples[idx]
+            metadata["manifest_path"] = strict_sample.manifest_path
+            metadata["manifest_row_index"] = strict_sample.manifest_index
 
         return fused_img, mask_tensor, metadata
+
+    @staticmethod
+    def _reject_strict_dataset_overrides(
+        kwargs: Dict[str, Any],
+        *,
+        dataset_name: str,
+    ) -> None:
+        forbidden = {"ids_or_paths", "img_root", "mask_root", "ids_are_paths", "mode"}
+        bad = sorted(name for name in forbidden if name in kwargs)
+        if bad:
+            raise ValueError(
+                f"strict paired mode manages {dataset_name} internally; do not pass {bad}"
+            )
+        if "validate" in kwargs:
+            raise ValueError(
+                f"strict paired mode validates jointly; do not pass 'validate' in "
+                f"{dataset_name}"
+            )
+
+    def _assert_strict_pairing(self) -> None:
+        if not self._strict_manifest_samples:
+            raise ValueError("strict paired mode requires manifest-backed sample records")
+
+        expected_ids = [sample.sample_id for sample in self._strict_manifest_samples]
+        sar_ids = self._ordered_dataset_ids(self.sar_dataset)
+        optical_ids = self._ordered_dataset_ids(self.optical_dataset)
+
+        if len(sar_ids) != len(optical_ids) or len(sar_ids) != len(expected_ids):
+            raise ValueError(
+                "strict paired mode requires exact parity: "
+                f"len(sar_ids)={len(sar_ids)}, "
+                f"len(optical_ids)={len(optical_ids)}, "
+                f"len(manifest_ids)={len(expected_ids)}"
+            )
+        if sar_ids != expected_ids:
+            raise ValueError(
+                "SAR dataset order drifted from Combined manifest order in strict paired mode"
+            )
+        if optical_ids != expected_ids:
+            raise ValueError(
+                "Optical dataset order drifted from Combined manifest order in strict paired mode"
+            )
+
+        sar_samples = getattr(self.sar_dataset, "samples", None)
+        optical_samples = getattr(self.optical_dataset, "samples", None)
+        if sar_samples is not None:
+            for sample, manifest_sample in zip(sar_samples, self._strict_manifest_samples):
+                if str(sample["img_path"]) != manifest_sample.sar_path:
+                    raise ValueError(
+                        f"SAR dataset img_path drifted for id='{manifest_sample.sample_id}'"
+                    )
+        if optical_samples is not None:
+            for sample, manifest_sample in zip(
+                optical_samples,
+                self._strict_manifest_samples,
+            ):
+                if str(sample["img_path"]) != manifest_sample.optical_path:
+                    raise ValueError(
+                        f"Optical dataset img_path drifted for id='{manifest_sample.sample_id}'"
+                    )
+
+    def _ordered_dataset_ids(self, dataset: Dataset) -> List[str]:
+        samples_attr = getattr(dataset, "samples", None)
+        if samples_attr is not None:
+            return [str(sample["id"]) for sample in samples_attr]
+        ordered_ids: List[str] = []
+        for idx in range(len(dataset)):  # type: ignore[arg-type]
+            _, _, meta = dataset[idx]
+            ordered_ids.append(str(meta.get("id", idx)))
+        return ordered_ids
 
     def _infer_optical_bands(self) -> int:
         """Infer optical channel count once and keep it consistent."""
@@ -228,5 +400,6 @@ class FusedDataset(Dataset):
             f"n_sar={n_sar}, "
             f"n_optical={n_opt}, "
             f"n_paired={n_paired}, "
-            f"policy={self.optical_missing_policy!r})"
+            f"policy={self.optical_missing_policy!r}, "
+            f"strict_paired={self.strict_pairing})"
         )
