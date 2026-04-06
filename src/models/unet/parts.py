@@ -21,6 +21,7 @@ class DoubleConv(nn.Module):
             nn.ReLU(inplace=True),
         )
 
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return self.double_conv(x)
 
