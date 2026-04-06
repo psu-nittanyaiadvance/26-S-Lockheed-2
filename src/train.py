@@ -13,31 +13,89 @@ from torch import optim
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
+
+from binary_mode import (
+    ACTIVE_BINARY_METRIC_THRESHOLD,
+    compute_binary_confusion,
+    prepare_binary_target,
+    prepare_binary_valid_mask,
+    require_active_binary_mode,
+)
 from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
-def tversky_loss(inputs, targets, alpha, beta, epsilon=1e-6):
+
+DEFAULT_MASK_ID_SUFFIX_MAP = {
+    "S1Hand": "S1OtsuLabelHand",
+    "S1Weak": "S1OtsuLabelWeak",
+}
+
+
+def resolve_mask_id(image_id, mask_dir, mask_id_suffix_map):
+    direct_tif = mask_dir / f"{image_id}.tif"
+    direct_tiff = mask_dir / f"{image_id}.tiff"
+    if direct_tif.exists() or direct_tiff.exists():
+        return image_id
+
+    for img_suffix, mask_suffix in mask_id_suffix_map.items():
+        if image_id.endswith(img_suffix):
+            mask_id = f"{image_id[:-len(img_suffix)]}{mask_suffix}"
+            mask_tif = mask_dir / f"{mask_id}.tif"
+            mask_tiff = mask_dir / f"{mask_id}.tiff"
+            if mask_tif.exists() or mask_tiff.exists():
+                return mask_id
+
+    return None
+
+
+# Standard focal-Tversky uses (1 - TI)^gamma. Keeping gamma at 4/3 preserves
+# the historical active-path loss curve after correcting gamma semantics.
+def focal_tversky_loss(inputs, targets, alpha, beta, gamma=4.0 / 3.0, valid_mask=None, epsilon=1e-6):
     # 1. Apply sigmoid (binary) or softmax (multiclass) to get probabilities
     inputs = torch.sigmoid(inputs) if inputs.shape[1] == 1 else F.softmax(inputs, dim=1)
+
+    if inputs.shape[1] == 1:
+        targets = prepare_binary_target(targets).to(device=inputs.device, dtype=inputs.dtype)
+        valid_mask = prepare_binary_valid_mask(valid_mask, inputs)
     
     # 2. Flatten ONLY the spatial dimensions (Height x Width)
     # This preserves the Batch (dim 0) and Class (dim 1) boundaries
     # Shape changes from [Batch, Classes, Height, Width] -> [Batch, Classes, Pixels]
     inputs = inputs.view(inputs.shape[0], inputs.shape[1], -1)
     targets = targets.view(targets.shape[0], targets.shape[1], -1)
-    
-    # 3. Calculate True Positives, False Positives, and False Negatives
+
+    if valid_mask is not None:
+        # Force valid_mask to align with [B, C, Pixels]
+        # Accepts [B,H,W] or [B,1,H,W] and converts to [B,1,Pixels]
+        if valid_mask.ndim == 3:
+            valid_mask = valid_mask.unsqueeze(1)  # [B,1,H,W]
+        # Now flatten spatial dims to Pixels using the SAME Pixels length as inputs
+        valid_mask = valid_mask.reshape(inputs.shape[0], 1, inputs.shape[2]).to(inputs.dtype)
+    else:
+        # If no mask provided, treat all pixels as valid
+        valid_mask = torch.ones((inputs.shape[0], 1, inputs.shape[2]), device=inputs.device, dtype=inputs.dtype)
+
     # We sum across dim=2 (the flattened pixels) to get totals PER CLASS
-    TP = (inputs * targets).sum(dim=2)    
-    FP = ((1 - targets) * inputs).sum(dim=2)
-    FN = (targets * (1 - inputs)).sum(dim=2)
+    # Invalid pixels are excluded via multiplication by valid_mask
+    TP = (inputs * targets * valid_mask).sum(dim=2)    
+    FP = ((1 - targets) * inputs * valid_mask).sum(dim=2)
+    FN = (targets * (1 - inputs) * valid_mask).sum(dim=2)
     
     # 4. Calculate the Tversky index (Yields a score for each class, per image)
     tversky_index = (TP + epsilon) / (TP + alpha * FP + beta * FN + epsilon)
+
+    # NaN-safety for focal transform:
+    tversky_index = tversky_index.clamp(0.0, 1.0)
+    focal_base = (1.0 - tversky_index).clamp(min=epsilon, max=1.0)
+
     
-    # 5. Average the scores across all classes and batches, then subtract from 1
-    return 1 - tversky_index.mean()
+    # Apply the standard focal-Tversky transform (1 - TI)^gamma before averaging.
+    focal_tversky = focal_base.pow(gamma)
+
+    # 5. Average the focal scores across all classes and batches
+    return focal_tversky.mean()
+    
 
 def _extract_ignore_mask(metas, device, masks):
     if masks is None or metas is None:
@@ -100,29 +158,19 @@ def init_metric_state(n_classes):
 
 def update_metric_state(state, logits, masks, n_classes, ignore_mask=None):
     if n_classes == 1:
-        if masks.ndim == 4 and masks.shape[1] == 1:
-            masks_bin = masks.squeeze(1)
-        else:
-            masks_bin = masks
-        probs = torch.sigmoid(logits)
-        if probs.ndim == 4 and probs.shape[1] == 1:
-            probs = probs.squeeze(1)
-        preds = (probs > 0.5)
-        valid = torch.ones_like(masks_bin, dtype=torch.bool)
+        valid_mask = None
         if ignore_mask is not None:
-            if ignore_mask.ndim == 4 and ignore_mask.shape[1] == 1:
-                ignore_mask = ignore_mask.squeeze(1)
-            valid = ~ignore_mask.bool()
-        true = masks_bin.bool()
-        pred = preds.bool()
-        tp = (pred & true & valid).sum().item()
-        fp = (pred & ~true & valid).sum().item()
-        fn = (~pred & true & valid).sum().item()
-        tn = (~pred & ~true & valid).sum().item()
-        state["tp"] += tp
-        state["fp"] += fp
-        state["fn"] += fn
-        state["tn"] += tn
+            valid_mask = ~prepare_binary_valid_mask(ignore_mask, logits)
+        confusion = compute_binary_confusion(
+            logits,
+            masks,
+            valid_mask=valid_mask,
+            threshold=ACTIVE_BINARY_METRIC_THRESHOLD,
+        )
+        state["tp"] += confusion["tp"].item()
+        state["fp"] += confusion["fp"].item()
+        state["fn"] += confusion["fn"].item()
+        state["tn"] += confusion["tn"].item()
         return
 
     if masks.ndim == 4 and masks.shape[1] == 1:
@@ -184,23 +232,90 @@ def finalize_metrics(state, n_classes):
     mean_dice = sum(valid_dices) / len(valid_dices) if valid_dices else float("nan")
     return {"iou": mean_iou, "dice": mean_dice, "iou_per_class": ious, "dice_per_class": dices}
 
+
+def should_save_checkpoint(epoch, epochs, save_every=50):
+    return epoch == epochs or (save_every > 0 and epoch % save_every == 0)
+
+
+def active_dict_collate(batch):
+    if not batch:
+        raise ValueError("Empty batch")
+
+    images = torch.stack([b[0] for b in batch], dim=0)
+    masks = []
+    valid_masks = []
+    metas = []
+
+    for image, mask, meta in batch:
+        if mask is None:
+            raise ValueError("Active training requires labeled samples with masks.")
+        if mask.ndim != 3 or mask.shape[0] != 1:
+            raise ValueError(f"Active mask must have shape [1,H,W], got {tuple(mask.shape)}")
+
+        vm = meta.get("valid_mask", None)
+        if vm is None:
+            raise KeyError("Sample metadata is missing 'valid_mask'.")
+        if not isinstance(vm, torch.Tensor):
+            vm = torch.as_tensor(vm)
+        if vm.ndim == 3:
+            if vm.shape[0] != 1:
+                raise ValueError(f"valid_mask must have shape [H,W] or [1,H,W], got {tuple(vm.shape)}")
+            vm = vm.squeeze(0)
+        elif vm.ndim != 2:
+            raise ValueError(f"valid_mask must have shape [H,W] or [1,H,W], got {tuple(vm.shape)}")
+
+        expected_hw = tuple(image.shape[-2:])
+        if tuple(vm.shape) != expected_hw:
+            y0 = meta.get("patch_y0", None)
+            x0 = meta.get("patch_x0", None)
+            ps = meta.get("patch_size", None)
+            if y0 is None or x0 is None or ps is None:
+                raise ValueError(
+                    f"valid_mask shape mismatch without patch metadata: got {tuple(vm.shape)}, "
+                    f"expected {expected_hw}"
+                )
+            vm = vm[y0 : y0 + ps, x0 : x0 + ps]
+
+        if tuple(vm.shape) != expected_hw:
+            raise ValueError(
+                f"valid_mask shape mismatch after patch alignment: got {tuple(vm.shape)}, "
+                f"expected {expected_hw}"
+            )
+
+        masks.append(mask)
+        valid_masks.append(vm.to(dtype=torch.bool))
+        metas.append(dict(meta))
+
+    return {
+        'image': images,
+        'mask': torch.stack(masks, dim=0),
+        'valid_mask': torch.stack(valid_masks, dim=0),
+        'meta': metas,
+    }
+
 def train_model(
         model,
         device,
         epochs: int = 5,
         batch_size: int = 1,
-        learning_rate: float = 1e-5,
+        learning_rate: float = 1e-4,
         val_percent: float = 0.1,
         save_checkpoint: bool = True,
         img_scale: float = 0.5,
         amp: bool = False,
-        weight_decay: float = 1e-8,
-        gradient_clipping: float = 1.0,
-        tv_alpha = 0.7, #confirm default for Tversky alpha
-        tv_beta = 0.3, #confirm default for Tversky beta
+        weight_decay: float = 5e-3,
+        gradient_clipping: float = 0.5,
+        tv_alpha = 0.4, #confirm default for Tversky alpha
+        tv_beta = 0.6, #confirm default for Tversky beta
+        tv_gamma= 4.0 / 3.0,
         adam_betas = (0.9, 0.999),
         n_classes = 1
         ):
+    """
+    Active supported mode: Phase 1 SAR-only binary flood segmentation.
+    Multiclass training remains in the repo but is not supported on this path.
+    """
+    require_active_binary_mode(n_classes, "train_model()")
 
     #optimizer setup
     optimizer = optim.AdamW(
@@ -210,23 +325,36 @@ def train_model(
     weight_decay=weight_decay
     )
 
-    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=3)
+    scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.3, patience=8)
 
-    writer = SummaryWriter(comment=f'LR_{learning_rate}_BS_{batch_size}')
+    writer = SummaryWriter(log_dir=output_dir / 'logs')
     logging.info(f"Hyperparameters: {locals()}")
 
-    #define loss function with Tversky
-    criterion = lambda inputs, targets: tversky_loss(inputs, targets, alpha=tv_alpha, beta=tv_beta)
+    
+    #variables to initialize best validation score tracking for checkpointing
+    best_val_iou = -1.0
+    best_epoch = -1
 
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='max', factor=0.1, patience=5)
 
     grad_scaler = torch.amp.GradScaler(device=device.type, enabled=amp)
     global_step = 0
 
+    #define loss function with Tversky
+    criterion = lambda inputs, targets, vm=None: focal_tversky_loss(
+        inputs, targets,
+        alpha=tv_alpha,
+        beta=tv_beta,
+        gamma=tv_gamma,
+        valid_mask=vm
+    )
+
+
     for epoch in range(1, epochs + 1):
         #model into training mode
         model.train()
         epoch_loss = 0
+        last_val_score = None
 
         #create progress bar as a 
         with tqdm(total=n_train, desc=f'Epoch {epoch}/{epochs}', unit='img') as progress_bar:
@@ -241,25 +369,17 @@ def train_model(
 
                 #format and load to device
                 images = images.to(device=device, dtype=torch.float32, memory_format=torch.channels_last)
-                true_masks = true_masks.to(device=device, dtype=torch.long)
+                true_masks = true_masks.to(device=device)
                 valid_mask = valid_mask.to(device=device)
 
                 #forward pass
                 with torch.autocast(device.type if device.type != 'mps' else 'cpu', enabled=amp):
                     masks_pred = model(images)
-                    
-                    if model.n_classes == 1:
-                        # Add a channel dimension to true_masks so it matches masks_pred shape [Batch, 1, Height, Width]
-                        target_masks = true_masks.unsqueeze(1).float()
-                        loss_px = criterion(masks_pred, target_masks)
-                    else:
-                        # One-hot encode the target masks and rearrange dimensions to match masks_pred
-                        target_masks = F.one_hot(true_masks, model.n_classes).permute(0, 3, 1, 2).float()
-                        loss_px = criterion(masks_pred, target_masks)
-                    vm = valid_mask
-                    if loss_px.ndim == 4 and vm.ndim == 3:
-                        vm = vm.unsqueeze(1)
-                    loss = (loss_px * vm).sum() / vm.sum().clamp(1)
+                    target_masks = prepare_binary_target(true_masks).to(
+                        device=device, dtype=masks_pred.dtype
+                    )
+                    valid_mask = prepare_binary_valid_mask(valid_mask, masks_pred)
+                    loss = criterion(masks_pred, target_masks, valid_mask)
                         
                 #clear previous gradients
                 optimizer.zero_grad(set_to_none=True)
@@ -279,57 +399,101 @@ def train_model(
                 progress_bar.set_postfix(**{'loss (batch)': loss.item()})
 
                 # --- Evaluation round (Local Logging Version) ---
-                division_step = (n_train // (5 * batch_size))
-                if division_step > 0 and val_loader is not None:
-                    if global_step % division_step == 0:
-                        # 1. Log Weights and Gradients Histograms
-                        for tag, value in model.named_parameters():
-                            tag = tag.replace('/', '.')
-                            if not (torch.isinf(value) | torch.isnan(value)).any():
-                                writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
-                            if value.grad is not None:
-                                if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
-                                    writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
+                if val_loader is not None and progress_bar.n >= n_train:
+                    # 1. Log Weights and Gradients Histograms
+                    for tag, value in model.named_parameters():
+                        tag = tag.replace('/', '.')
+                        if not (torch.isinf(value) | torch.isnan(value)).any():
+                            writer.add_histogram(f'Weights/{tag}', value.data.cpu(), global_step)
+                        if value.grad is not None:
+                            if not (torch.isinf(value.grad) | torch.isnan(value.grad)).any():
+                                writer.add_histogram(f'Gradients/{tag}', value.grad.data.cpu(), global_step)
 
-                        # 2. Run Evaluation
-                        val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=args.classes) 
+                    # 2. Run Evaluation
+                    val_score = evaluate(model, val_loader, device, amp, criterion, n_classes=n_classes)
+                    last_val_score = val_score
 
-                        # val_score is a dict from evaluate()
-                        for k, v in val_score.items():
-                            # TensorBoard expects numeric scalars; skip non-scalars defensively
-                            if isinstance(v, (int, float)):
-                                writer.add_scalar(f'Validation/{k}', v, global_step)
+                    # val_score is a dict from evaluate()
+                    for k, v in val_score.items():
+                        # TensorBoard expects numeric scalars; skip non-scalars defensively
+                        if isinstance(v, (int, float)):
+                            writer.add_scalar(f'Validation/{k}', v, global_step)
+                            
+                    
+                    scheduler.step(val_score["val_flood_iou"])
 
-
-                                
-                        scheduler.step(val_score["miou"])
-
+                    # 3. Log Scalars and Images to TensorBoard
+                    try:
+                        writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
+                        # This groups them together in the UI
+                        writer.add_scalars('Validation/Flood_Metrics', {
+                            'Precision': val_score['val_flood_precision'],
+                            'Recall': val_score['val_flood_recall'],
+                            'F1': val_score['val_flood_f1']
+                            }, global_step)
                         
+                        # Log the first image in the batch
+                        # Note: TensorBoard expects (C, H, W)
+                        writer.add_image('Visuals/Image', images[0].cpu(), global_step)
+                        
+                        # Ground Truth Mask (adding channel dim)
+                        writer.add_image('Visuals/Mask_True', target_masks[0].float().cpu(), global_step)
+                        
+                        # Visualization uses the active validation threshold but is not reused by metric code.
+                        pred_mask = (
+                            torch.sigmoid(masks_pred)[0, 0] > ACTIVE_BINARY_METRIC_THRESHOLD
+                        ).float().cpu().unsqueeze(0)
+                        
+                        writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
+                    except Exception as e:
+                        logging.warning(f"Could not log to TensorBoard: {e}")
 
-                        # 3. Log Scalars and Images to TensorBoard
-                        try:
-                            writer.add_scalar('Learning_Rate', optimizer.param_groups[0]['lr'], global_step)
-                            writer.add_scalar('Validation/Dice', val_score, global_step)
-                            
-                            # Log the first image in the batch
-                            # Note: TensorBoard expects (C, H, W)
-                            writer.add_image('Visuals/Image', images[0].cpu(), global_step)
-                            
-                            # Ground Truth Mask (adding channel dim)
-                            writer.add_image('Visuals/Mask_True', true_masks[0].float().cpu().unsqueeze(0), global_step)
-                            
-                            # Predicted Mask (taking argmax and adding channel dim)
-                            pred_mask = masks_pred.argmax(dim=1)[0].float().cpu().unsqueeze(0)
-                            writer.add_image('Visuals/Mask_Pred', pred_mask, global_step)
-                        except Exception as e:
-                            logging.warning(f"Could not log to TensorBoard: {e}")
+        
+        if last_val_score is not None:
+            print(
+                f"Validation Results:\n"
+                f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n"
+                f"  Loss:      {last_val_score['val_loss']:.4f}\n"
+                f"  Accuracy:  {last_val_score['val_accuracy']:.4f}\n"
+                f"  mIoU:      {last_val_score['val_mIoU']:.4f}\n"
+                f"  Flood Metrics -> "
+                f"IoU: {last_val_score['val_flood_iou']:.4f} | "
+                f"Prec: {last_val_score['val_flood_precision']:.4f} | "
+                f"Recall: {last_val_score['val_flood_recall']:.4f} | "
+                f"F1: {last_val_score['val_flood_f1']:.4f}"
+            )
+            # Check if this is the best validation score
+            current_val_score = last_val_score['val_flood_iou']
+            if current_val_score > best_val_iou:
+                best_val_iou = current_val_score
+                best_epoch = epoch
+                # Save best checkpoint
+                if save_checkpoint:
+                    Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
+                    state_dict = model.state_dict()
+                    state_dict['mask_values'] = dataset.mask_values
+                    torch.save(state_dict, str(dir_checkpoint / 'best_checkpoint.pth'))
+                    logging.info(f'Best checkpoint saved! (Epoch {epoch}, IoU: {best_val_iou:.4f})')
+
+        else:
+            print(
+                f"Epoch {epoch}/{epochs} complete:\n"
+                f"  Learning Rate: {optimizer.param_groups[0]['lr']:.6f}\n"
+                f"  Train Loss: {(epoch_loss / max(len(train_loader), 1)):.4f}\n"
+                f"  Validation: disabled"
+            )
         
         if save_checkpoint:
             Path(dir_checkpoint).mkdir(parents=True, exist_ok=True)
             state_dict = model.state_dict()
             state_dict['mask_values'] = dataset.mask_values
-            torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
-            logging.info(f'Checkpoint {epoch} saved!')
+            if should_save_checkpoint(epoch, epochs):
+                torch.save(state_dict, str(dir_checkpoint / 'checkpoint_epoch{}.pth'.format(epoch)))
+                logging.info(f'Checkpoint {epoch} saved!')
+                
+    # Log best epoch at the end of training
+    if last_val_score is not None:
+        logging.info(f'Training completed. Best validation IoU: {best_val_iou:.4f} at epoch {best_epoch}')
 
 
 # This argparse block defines command-line options so you can run training with different
@@ -348,11 +512,18 @@ def get_args():
                         help='Percent of the data that is used as validation (0-100)')
     parser.add_argument('--amp', action='store_true', default=False, help='Use mixed precision')
     parser.add_argument('--bilinear', action='store_true', default=False, help='Use bilinear upsampling')
-    parser.add_argument('--classes', '-c', type=int, default=2, help='Number of classes')
+    parser.add_argument(
+        '--classes',
+        '-c',
+        type=int,
+        default=1,
+        help='Number of classes. Active Phase 1 training supports binary flood segmentation only (use 1).',
+    )
     parser.add_argument('--img-dir', type=str, required=True, help='Path to SAR image .tif/.tiff files')
     parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .tif/.tiff files')
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
+    parser.add_argument('--output-dir', type=str, default='runs/default',help='Directory to save logs and checkpoints')
 
     return parser.parse_args()
 
@@ -363,6 +534,12 @@ if __name__ == '__main__':
     logging.basicConfig(level=logging.INFO, format='%(levelname)s: %(message)s')
 
     args = get_args()
+    require_active_binary_mode(args.classes, "train.py")
+
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     model = UNetModel(n_channels=2, n_classes=args.classes, bilinear=args.bilinear)
@@ -384,17 +561,13 @@ if __name__ == '__main__':
     torch.manual_seed(seed)
     img_dir = Path(args.img_dir)
     mask_dir = Path(args.mask_dir)
-    mask_id_suffix_map = {'S1Hand': 'S1OtsuLabelHand'}
+    mask_id_suffix_map = dict(DEFAULT_MASK_ID_SUFFIX_MAP)
     ids = list_ids_from_dir(args.img_dir, recursive=True)
     paired_ids_list = []
     missing_in_masks = 0
     for image_id in ids:
-        mask_id = image_id
-        if image_id.endswith("S1Hand"):
-            mask_id = f"{image_id[:-len('S1Hand')]}S1OtsuLabelHand"
-        mask_tif = mask_dir / f"{mask_id}.tif"
-        mask_tiff = mask_dir / f"{mask_id}.tiff"
-        if mask_tif.exists() or mask_tiff.exists():
+        mask_id = resolve_mask_id(image_id, mask_dir, mask_id_suffix_map)
+        if mask_id is not None:
             paired_ids_list.append(image_id)
         else:
             missing_in_masks += 1
@@ -426,37 +599,13 @@ if __name__ == '__main__':
     dataset = base_dataset
     n_train = len(train_set)
 
-    def _dict_collate(batch):
-        images = torch.stack([b[0] for b in batch], dim=0)
-        masks = torch.stack([b[1] for b in batch], dim=0)
-        valid_masks = []
-        for b in batch:
-            meta = b[2]
-            vm = meta.get("valid_mask", None)
-            if vm is None:
-                raise KeyError("Sample metadata is missing 'valid_mask'.")
-            if not isinstance(vm, torch.Tensor):
-                vm = torch.as_tensor(vm)
-            if vm.shape[-2:] != b[0].shape[-2:]:
-                y0 = meta.get("patch_y0", None)
-                x0 = meta.get("patch_x0", None)
-                ps = meta.get("patch_size", None)
-                if y0 is not None and x0 is not None and ps is not None:
-                    if vm.ndim == 2:
-                        vm = vm[y0 : y0 + ps, x0 : x0 + ps]
-                    elif vm.ndim == 3:
-                        vm = vm[:, y0 : y0 + ps, x0 : x0 + ps]
-            valid_masks.append(vm)
-        valid_masks = torch.stack(valid_masks, dim=0)
-        return {'image': images, 'mask': masks, 'valid_mask': valid_masks}
-
     num_workers = getattr(args, 'num_workers', 0)
     train_loader = DataLoader(
         train_set,
         batch_size=args.batch_size,
         shuffle=True,
         num_workers=num_workers,
-        collate_fn=_dict_collate
+        collate_fn=active_dict_collate
     )
     val_loader = None
     if val_set is not None:
@@ -465,9 +614,9 @@ if __name__ == '__main__':
             batch_size=args.batch_size,
             shuffle=False,
             num_workers=num_workers,
-            collate_fn=_dict_collate
+            collate_fn=active_dict_collate
         )
-    dir_checkpoint = Path('checkpoints')
+    dir_checkpoint = output_dir / 'checkpoints'
     try:
         train_model(
             model=model,

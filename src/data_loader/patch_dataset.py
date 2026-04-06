@@ -219,6 +219,27 @@ class PatchDataset(Dataset):
         patch_meta["patch_y0"] = y0
         patch_meta["patch_x0"] = x0
         patch_meta["patch_size"] = ps
+        if "valid_mask" in meta:
+            valid_mask = meta["valid_mask"]
+            if valid_mask is not None:
+                if not isinstance(valid_mask, torch.Tensor):
+                    valid_mask = torch.as_tensor(valid_mask)
+                if valid_mask.ndim == 3:
+                    if valid_mask.shape[0] != 1:
+                        raise ValueError(
+                            "valid_mask must have shape [H,W] or [1,H,W]; "
+                            f"got {tuple(valid_mask.shape)}"
+                        )
+                    patch_meta["valid_mask"] = valid_mask[:, y0 : y0 + ps, x0 : x0 + ps]
+                elif valid_mask.ndim == 2:
+                    patch_meta["valid_mask"] = valid_mask[y0 : y0 + ps, x0 : x0 + ps]
+                else:
+                    base_id = meta.get("id", f"base_{pi.base_idx}")
+                    raise ValueError(
+                        "valid_mask must have shape [H,W] or [1,H,W]; "
+                        f"got {tuple(valid_mask.shape)} (id={base_id} "
+                        f"patch_y0={y0} patch_x0={x0})"
+                    )
         if "ignore_mask" in meta:
             ignore_mask = meta["ignore_mask"]
             if ignore_mask is not None:
@@ -258,6 +279,26 @@ class PatchDataset(Dataset):
                     "ignore_mask spatial shape mismatch: "
                     f"got {ignore_hw}, expected {mask_hw} (id={base_id} "
                     f"patch_y0={y0} patch_x0={x0})"
+                )
+        valid_mask = patch_meta.get("valid_mask", None)
+        if isinstance(valid_mask, torch.Tensor):
+            if valid_mask.ndim == 3:
+                valid_hw = tuple(valid_mask.shape[1:])
+            elif valid_mask.ndim == 2:
+                valid_hw = tuple(valid_mask.shape)
+            else:
+                base_id = meta.get("id", f"base_{pi.base_idx}")
+                raise ValueError(
+                    "valid_mask must have shape [1,H,W] or [H,W]; "
+                    f"got {tuple(valid_mask.shape)} (id={base_id} "
+                    f"patch_y0={y0} patch_x0={x0})"
+                )
+            if valid_hw != tuple(img_patch.shape[-2:]):
+                base_id = meta.get("id", f"base_{pi.base_idx}")
+                raise ValueError(
+                    "valid_mask spatial shape mismatch: "
+                    f"got {valid_hw}, expected {tuple(img_patch.shape[-2:])} "
+                    f"(id={base_id} patch_y0={y0} patch_x0={x0})"
                 )
 
         return img_patch, mask_patch, patch_meta
