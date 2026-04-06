@@ -8,6 +8,11 @@ from .collate import default_collate
 from .discover_ids import list_ids_from_dir, paired_ids
 from .patch_dataset import PatchDataset
 from .validate_dataset import validate_sample_shapes
+from .augmentations import (
+    build_train_transforms,
+    build_val_transforms,
+    Compose,
+)
 
 __all__ = [
     # Datasets
@@ -27,4 +32,8 @@ __all__ = [
     "paired_ids",
     # Validation
     "validate_sample_shapes",
+    # Augmentation
+    "build_train_transforms",
+    "build_val_transforms",
+    "Compose",
 ]
