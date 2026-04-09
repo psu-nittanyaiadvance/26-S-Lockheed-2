@@ -4,25 +4,33 @@ import argparse
 import json
 import logging
 import random
+import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 from torch import optim
 from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
-import torch_optimizer as t_o
 
-from DeCURLoss import DeCURLoss
-from ..data_loader import FusedDataset, PatchDataset, build_train_transforms, build_val_transforms
-from eval import evaluate_decur
-from ..models.decur.model import DeCUR
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "models"))
+
+from Multi_modal_src.DeCURLoss import DeCURLoss
+from Multi_modal_src.eval import build_decur_batch_views, evaluate_decur
+from data_loader import FusedDataset, build_train_transforms, build_val_transforms, multimodal_pretrain_collate
+from decur.model import DeCUR
 
 try:
     from torch.utils.tensorboard import SummaryWriter
 except Exception:
     SummaryWriter = None
+
+
+MODEL_SAR_CHANNELS = 2
+MODEL_OPTICAL_CHANNELS = 13
 
 
 # Fallback writer so the training loop can keep a single logging code path
@@ -62,120 +70,128 @@ def move_to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
-def _as_hw_mask(valid_mask: Optional[torch.Tensor], hw: torch.Size) -> torch.Tensor:
-    # Normalise all valid-mask variants to a plain [H, W] boolean tensor.
-    if valid_mask is None:
-        return torch.ones(hw, dtype=torch.bool)
-    if not isinstance(valid_mask, torch.Tensor):
-        valid_mask = torch.as_tensor(valid_mask)
-    if valid_mask.ndim == 3:
-        if valid_mask.shape[0] != 1:
-            raise ValueError(f"valid_mask must have shape [H,W] or [1,H,W], got {tuple(valid_mask.shape)}")
-        valid_mask = valid_mask.squeeze(0)
-    if valid_mask.ndim != 2:
-        raise ValueError(f"valid_mask must have shape [H,W], got {tuple(valid_mask.shape)}")
-    if tuple(valid_mask.shape) != tuple(hw):
-        raise ValueError(f"valid_mask shape mismatch: got {tuple(valid_mask.shape)}, expected {tuple(hw)}")
-    return valid_mask.to(dtype=torch.bool)
+def _grid_starts(length: int, patch: int, stride: int) -> List[int]:
+    if patch >= length:
+        return [0]
+    starts: List[int] = list(range(0, length - patch, stride))
+    last = length - patch
+    if not starts or starts[-1] < last:
+        starts.append(last)
+    return starts
 
 
-def _mask_invalid_pixels(image: torch.Tensor, valid_mask: torch.Tensor) -> torch.Tensor:
-    # Invalid pixels are zeroed before they hit the encoder so corrupted
-    # regions do not leak signal into the embedding space.
-    return image * valid_mask.unsqueeze(0).to(dtype=image.dtype)
+class _PatchIndex:
+    __slots__ = ("base_idx", "row", "col", "y0", "x0")
+
+    def __init__(self, base_idx: int, row: int, col: int, y0: int, x0: int) -> None:
+        self.base_idx = base_idx
+        self.row = row
+        self.col = col
+        self.y0 = y0
+        self.x0 = x0
 
 
-class PairedDeCURDataset(Dataset):
-    def __init__(self, base_dataset: Dataset, *, sar_channels: int = 2, train: bool = True) -> None:
+class PairedPatchDataset(Dataset):
+    def __init__(self, base_dataset: Dataset, patch_size: int = 256, overlap: float = 0.2) -> None:
+        if not (0.0 <= overlap < 1.0):
+            raise ValueError(f"overlap must be in [0, 1); got {overlap}")
+        if patch_size < 1:
+            raise ValueError(f"patch_size must be >= 1; got {patch_size}")
+
         self.base_dataset = base_dataset
-        self.sar_channels = sar_channels
-        self.sar_transform = build_train_transforms(modality="sar") if train else build_val_transforms()
-        self.opt_transform = build_train_transforms(modality="optical") if train else build_val_transforms()
+        self.patch_size = patch_size
+        self.overlap = overlap
+        self.stride = max(1, int(torch.ceil(torch.tensor(patch_size * (1.0 - overlap))).item()))
+        self._index = self._build_index()
+
+    def _build_index(self) -> List[_PatchIndex]:
+        index: List[_PatchIndex] = []
+        for base_idx in range(len(self.base_dataset)):  # type: ignore[arg-type]
+            sample = self.base_dataset[base_idx]
+            sar = sample["sar"]
+            optical = sample["optical"]
+            if tuple(sar.shape[-2:]) != tuple(optical.shape[-2:]):
+                raise ValueError(
+                    "SAR and optical spatial dims must match before patching; "
+                    f"got SAR {tuple(sar.shape)} and optical {tuple(optical.shape)}"
+                )
+
+            height, width = sar.shape[-2:]
+            for row, y0 in enumerate(_grid_starts(height, self.patch_size, self.stride)):
+                for col, x0 in enumerate(_grid_starts(width, self.patch_size, self.stride)):
+                    index.append(_PatchIndex(base_idx, row, col, y0, x0))
+
+        if not index:
+            raise ValueError("PairedPatchDataset index is empty")
+        return index
 
     def __len__(self) -> int:
-        return len(self.base_dataset)  # type: ignore[arg-type]
+        return len(self._index)
 
     def __getitem__(self, idx: int) -> Dict[str, Any]:
-        fused_image, _mask, meta = self.base_dataset[idx]
-        sample_id = str(meta.get("id", idx))
-        sar_channels = int(meta.get("n_sar_bands", self.sar_channels))
-        optical_channels = int(meta.get("n_optical_bands", fused_image.shape[0] - sar_channels))
-        if fused_image.shape[0] != sar_channels + optical_channels:
+        patch_index = self._index[idx]
+        sample = self.base_dataset[patch_index.base_idx]
+        patch_size = self.patch_size
+        y0, x0 = patch_index.y0, patch_index.x0
+
+        sar_patch = sample["sar"][:, y0 : y0 + patch_size, x0 : x0 + patch_size]
+        optical_patch = sample["optical"][:, y0 : y0 + patch_size, x0 : x0 + patch_size]
+        valid_mask = sample["valid_mask"]
+        if not isinstance(valid_mask, torch.Tensor):
+            valid_mask = torch.as_tensor(valid_mask)
+        if valid_mask.ndim == 3 and valid_mask.shape[0] == 1:
+            valid_mask = valid_mask[:, y0 : y0 + patch_size, x0 : x0 + patch_size]
+        elif valid_mask.ndim == 2:
+            valid_mask = valid_mask[y0 : y0 + patch_size, x0 : x0 + patch_size]
+        else:
             raise ValueError(
-                f"Channel split mismatch for id='{sample_id}': "
-                f"image has {fused_image.shape[0]} channels, expected {sar_channels + optical_channels}"
+                "paired valid_mask must have shape [H,W] or [1,H,W]; "
+                f"got {tuple(valid_mask.shape)}"
             )
 
-        base_valid_mask = _as_hw_mask(meta.get("valid_mask"), fused_image.shape[-2:])
-
-        # FusedDataset returns one concatenated tensor. Split it back into the
-        # modality-specific views expected by the DeCUR encoders.
-        sar_image = fused_image[:sar_channels].to(dtype=torch.float32)
-        opt_image = fused_image[sar_channels : sar_channels + optical_channels].to(dtype=torch.float32)
-
-        sar_meta = {"id": sample_id, "valid_mask": base_valid_mask.clone(), "modality": "sar"}
-        opt_meta = {"id": sample_id, "valid_mask": base_valid_mask.clone(), "modality": "optical"}
-
-        # DeCUR needs two augmented views per modality:
-        # SAR view 1 / SAR view 2 / optical view 1 / optical view 2.
-        sar_view_1, _, sar_meta_1 = self.sar_transform(sar_image.clone(), None, dict(sar_meta))
-        sar_view_2, _, sar_meta_2 = self.sar_transform(sar_image.clone(), None, dict(sar_meta))
-        opt_view_1, _, opt_meta_1 = self.opt_transform(opt_image.clone(), None, dict(opt_meta))
-        opt_view_2, _, opt_meta_2 = self.opt_transform(opt_image.clone(), None, dict(opt_meta))
-
-        sar_valid_1 = _as_hw_mask(sar_meta_1.get("valid_mask"), sar_view_1.shape[-2:])
-        sar_valid_2 = _as_hw_mask(sar_meta_2.get("valid_mask"), sar_view_2.shape[-2:])
-        opt_valid_1 = _as_hw_mask(opt_meta_1.get("valid_mask"), opt_view_1.shape[-2:])
-        opt_valid_2 = _as_hw_mask(opt_meta_2.get("valid_mask"), opt_view_2.shape[-2:])
+        meta = dict(sample["meta"])
+        base_id = str(meta.get("id", f"base_{patch_index.base_idx}"))
+        meta["id"] = f"{base_id}_r{patch_index.row}_c{patch_index.col}"
+        meta["base_id"] = base_id
+        meta["patch_row"] = patch_index.row
+        meta["patch_col"] = patch_index.col
+        meta["patch_y0"] = y0
+        meta["patch_x0"] = x0
+        meta["patch_size"] = patch_size
 
         return {
-            "sample_id": sample_id,
-            "sar_view_1": _mask_invalid_pixels(sar_view_1, sar_valid_1),
-            "sar_view_2": _mask_invalid_pixels(sar_view_2, sar_valid_2),
-            "opt_view_1": _mask_invalid_pixels(opt_view_1, opt_valid_1),
-            "opt_view_2": _mask_invalid_pixels(opt_view_2, opt_valid_2),
-            "sar_valid_1": sar_valid_1,
-            "sar_valid_2": sar_valid_2,
-            "opt_valid_1": opt_valid_1,
-            "opt_valid_2": opt_valid_2,
+            "sar": sar_patch,
+            "optical": optical_patch,
+            "valid_mask": valid_mask,
+            "meta": meta,
         }
 
 
-def decur_collate(batch) -> Dict[str, Any]:
-    if not batch:
-        raise ValueError("Empty batch")
-    # Keep the collate output explicit so the train loop can address each
-    # modality/view directly without unpacking tuples by position.
-    tensor_keys = [
-        "sar_view_1",
-        "sar_view_2",
-        "opt_view_1",
-        "opt_view_2",
-        "sar_valid_1",
-        "sar_valid_2",
-        "opt_valid_1",
-        "opt_valid_2",
-    ]
-    collated = {key: torch.stack([item[key] for item in batch], dim=0) for key in tensor_keys}
-    collated["sample_id"] = [item["sample_id"] for item in batch]
-    return collated
+def _require_supported_channel_config(args: argparse.Namespace) -> None:
+    if args.sar_channels != MODEL_SAR_CHANNELS or args.optical_channels != MODEL_OPTICAL_CHANNELS:
+        raise ValueError(
+            "The current DeCUR model supports only "
+            f"sar_channels={MODEL_SAR_CHANNELS} and optical_channels={MODEL_OPTICAL_CHANNELS}; "
+            f"got sar_channels={args.sar_channels}, optical_channels={args.optical_channels}"
+        )
 
 
 def build_datasets(args: argparse.Namespace) -> tuple[Dataset, Optional[Dataset]]:
+    _require_supported_channel_config(args)
+
     # Strict manifest loading guarantees SAR and optical stay paired in the
     # same canonical order before any random train/val split happens.
     fused_dataset = FusedDataset.from_combined_manifest(
         args.combined_root,
         mode="none",
+        return_mode="paired",
         sar_dataset_kwargs={
             "log_transform": args.sar_log_transform,
             "expected_img_bands": args.sar_channels,
-            "validate": False,
         },
         optical_dataset_kwargs={
             "expected_img_bands": args.optical_channels,
             "reflectance_clip_percentile": args.optical_clip_percentile,
-            "validate": False,
         },
         require_spatial_match=True,
         validate=args.validate_manifest,
@@ -192,13 +208,11 @@ def build_datasets(args: argparse.Namespace) -> tuple[Dataset, Optional[Dataset]
     if args.patch_size > 0:
         # Patch after the split so patches from the same parent tile do not
         # leak across train and validation.
-        train_source = PatchDataset(train_source, patch_size=args.patch_size, overlap=args.patch_overlap)
+        train_source = PairedPatchDataset(train_source, patch_size=args.patch_size, overlap=args.patch_overlap)
         if val_source is not None:
-            val_source = PatchDataset(val_source, patch_size=args.patch_size, overlap=args.patch_overlap)
+            val_source = PairedPatchDataset(val_source, patch_size=args.patch_size, overlap=args.patch_overlap)
 
-    train_dataset = PairedDeCURDataset(train_source, sar_channels=args.sar_channels, train=True)
-    val_dataset = None if val_source is None else PairedDeCURDataset(val_source, sar_channels=args.sar_channels, train=False)
-    return train_dataset, val_dataset
+    return train_source, val_source
 
 
 def create_writer(output_dir: Path):
@@ -259,13 +273,25 @@ def train_model(args: argparse.Namespace) -> None:
         "num_workers": args.num_workers,
         "pin_memory": device.type == "cuda",
         "persistent_workers": args.num_workers > 0,
-        "collate_fn": decur_collate,
+        "collate_fn": multimodal_pretrain_collate,
     }
     train_loader = DataLoader(train_dataset, shuffle=True, **loader_kwargs)
     val_loader = None if val_dataset is None else DataLoader(val_dataset, shuffle=False, **loader_kwargs)
 
+    sar_transform = build_train_transforms(modality="sar")
+    opt_transform = build_train_transforms(modality="optical")
+    val_sar_transform = build_val_transforms()
+    val_opt_transform = build_val_transforms()
+
     model = DeCUR().to(device=device)
     loss_fn = DeCURLoss(common_dim=args.common_dim, lambda_param=args.lambda_param).to(device=device)
+
+    try:
+        import torch_optimizer as t_o
+    except ImportError as exc:
+        raise ImportError(
+            "Multimodal DeCUR training requires the 'torch_optimizer' package for LARS."
+        ) from exc
 
 # 1. Isolate parameters for LARS
     regular_params = []
@@ -322,16 +348,21 @@ def train_model(args: argparse.Namespace) -> None:
         
         # 1. TRADITIONAL INNER LOOP (Mathematically correct for DeCUR)
         for batch in progress:
-            batch = move_to_device(batch, device)
+            views = build_decur_batch_views(
+                batch,
+                sar_transform=sar_transform,
+                opt_transform=opt_transform,
+            )
+            views = move_to_device(views, device)
             optimizer.zero_grad(set_to_none=True)
 
             with torch.autocast(device_type=autocast_device, enabled=args.amp):
                 # Calculations based on full batch statistics as per Eq. 1 [cite: 79]
                 z_sar_1, z_sar_2, z_opt_1, z_opt_2 = model(
-                    batch["sar_view_1"],
-                    batch["sar_view_2"],
-                    batch["opt_view_1"],
-                    batch["opt_view_2"],
+                    views["sar_view_1"],
+                    views["sar_view_2"],
+                    views["opt_view_1"],
+                    views["opt_view_2"],
                 )
                 loss = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)
 
@@ -371,6 +402,8 @@ def train_model(args: argparse.Namespace) -> None:
                 device=device,
                 amp=args.amp,
                 common_dim=args.common_dim,
+                sar_transform=val_sar_transform,
+                opt_transform=val_opt_transform,
             )
             metrics.update(val_metrics)
 
@@ -439,8 +472,6 @@ def get_args() -> argparse.Namespace:
 
     if not 0.0 <= args.validation_split < 1.0:
         raise ValueError("--validation-split must be in [0,1)")
-    if args.grad_accum_steps < 1:
-        raise ValueError("--grad-accum-steps must be >= 1")
     if not 0.0 <= args.patch_overlap < 1.0:
         raise ValueError("--patch-overlap must be in [0,1)")
     if args.common_dim < 1:
