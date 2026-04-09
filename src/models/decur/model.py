@@ -106,9 +106,8 @@ class DeCUR(nn.Module):
             - batch_size (int): Batch size per GPU (used for correlation normalization)
     """
 
-    def __init__(self, args):
+    def __init__(self):
         super().__init__()
-        self.args = args
 
         # Encoders — one per modality
         self.encoder_SAR = UNetEncoder(n_channels=2)
