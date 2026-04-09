@@ -51,8 +51,25 @@ Strict paired mode guarantees:
   `sample_id`.
 - Missing optical fallback is not allowed.
 - Validation is joint/assertive rather than silently dropping one modality.
-- Metadata preserves canonical provenance (`id`, `sar_img_path`,
-  `optical_img_path`, `manifest_row_index`, `strict_paired_mode`).
+- Metadata preserves canonical provenance (`id`, `paired_sample_id`,
+  `sar_img_path`, `optical_img_path`, `label_path`, `manifest_row_index`,
+  `strict_paired_mode`).
+
+For pre-augmentation paired inspection, construct strict fused data with child
+`transforms=None` and use `get_paired_item(..., require_no_transforms=True)`:
+
+```python
+pair = fused_ds.get_paired_item(0, require_no_transforms=True)
+sar = pair["sar_image"]
+optical = pair["optical_image"]
+metadata = pair["metadata"]
+```
+
+You can also save a quick visualization without patching:
+
+```bash
+python scripts/visualize_sen12ms_pair.py path/to/Combined --index 0 --output pair.png
+```
 
 Do not treat raw `S1Hand` / `S2Hand` directory pairing as equivalent to strict
 paired mode. Those roots are useful for legacy or modality-specific workflows,

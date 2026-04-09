@@ -23,7 +23,14 @@ from binary_mode import (
 )
 from eval import evaluate
 from UNet.UNetModel import UNet as UNetModel
-from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
+from data_loader import (
+    FusedDataset,
+    PatchDataset,
+    SARDataset,
+    list_ids_from_dir,
+    multimodal_pretrain_collate,
+    validate_sample_shapes,
+)
 
 
 DEFAULT_MASK_ID_SUFFIX_MAP = {
@@ -293,6 +300,73 @@ def active_dict_collate(batch):
         'meta': metas,
     }
 
+
+def build_multimodal_pretrain_loader(
+    combined_root,
+    *,
+    batch_size,
+    num_workers=0,
+    shuffle=False,
+):
+    dataset = FusedDataset.from_combined_manifest(
+        combined_root,
+        mode="none",
+        return_mode="paired",
+    )
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        num_workers=num_workers,
+        collate_fn=multimodal_pretrain_collate,
+    )
+    return dataset, loader
+
+
+def _validate_multimodal_pretrain_batch(batch):
+    required = {"sar", "optical", "valid_mask", "meta"}
+    missing = sorted(name for name in required if name not in batch)
+    if missing:
+        raise KeyError(f"Multimodal pretrain batch is missing keys: {missing}")
+
+    sar = batch["sar"]
+    optical = batch["optical"]
+    valid_mask = batch["valid_mask"]
+    metas = batch["meta"]
+
+    if sar.ndim != 4:
+        raise ValueError(f"Expected batch['sar'] with shape [B,C,H,W], got {tuple(sar.shape)}")
+    if optical.ndim != 4:
+        raise ValueError(
+            f"Expected batch['optical'] with shape [B,C,H,W], got {tuple(optical.shape)}"
+        )
+    if valid_mask.ndim not in {3, 4}:
+        raise ValueError(
+            "Expected batch['valid_mask'] with shape [B,H,W] or [B,1,H,W], "
+            f"got {tuple(valid_mask.shape)}"
+        )
+    if sar.shape[0] != optical.shape[0] or sar.shape[0] != valid_mask.shape[0]:
+        raise ValueError("Multimodal batch tensors disagree on batch dimension")
+    if tuple(sar.shape[-2:]) != tuple(optical.shape[-2:]):
+        raise ValueError("SAR and optical spatial dims differ in multimodal batch")
+    valid_hw = tuple(valid_mask.shape[-2:])
+    if valid_hw != tuple(sar.shape[-2:]):
+        raise ValueError(
+            "valid_mask spatial dims do not match multimodal tensors: "
+            f"valid_mask={valid_hw}, image={tuple(sar.shape[-2:])}"
+        )
+    if not isinstance(metas, list) or len(metas) != sar.shape[0]:
+        raise ValueError("batch['meta'] must be a list aligned to batch size")
+    for idx, meta in enumerate(metas):
+        if not isinstance(meta, dict):
+            raise TypeError(f"batch['meta'][{idx}] must be a dict")
+        forbidden = [name for name in ("mask_path", "label_path") if name in meta]
+        if forbidden:
+            raise ValueError(
+                "Multimodal pretraining batch must not carry label-bearing metadata; "
+                f"found {forbidden} at meta index {idx}"
+            )
+
 def train_model(
         model,
         device,
@@ -517,8 +591,14 @@ def get_args():
         default=1,
         help='Number of classes. Active Phase 1 training supports binary flood segmentation only (use 1).',
     )
-    parser.add_argument('--img-dir', type=str, required=True, help='Path to SAR image .tif/.tiff files')
-    parser.add_argument('--mask-dir', type=str, required=True, help='Path to mask .tif/.tiff files')
+    parser.add_argument('--img-dir', type=str, default=None, help='Path to SAR image .tif/.tiff files')
+    parser.add_argument('--mask-dir', type=str, default=None, help='Path to mask .tif/.tiff files')
+    parser.add_argument(
+        '--multimodal-pretrain-root',
+        type=str,
+        default=None,
+        help='Path to Combined or Combined/manifest.csv for strict multimodal pretraining dataloader validation.',
+    )
     parser.add_argument('--num-workers', type=int, default=0, help='DataLoader worker count')
     parser.add_argument('--seed', type=int, default=0, help='Random seed')
     parser.add_argument('--output-dir', type=str, default='runs/default',help='Directory to save logs and checkpoints')
@@ -530,7 +610,29 @@ def get_args():
 #argparse usage in main
 if __name__ == '__main__':
     args = get_args()
+
+    if args.multimodal_pretrain_root:
+        dataset, loader = build_multimodal_pretrain_loader(
+            args.multimodal_pretrain_root,
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+            shuffle=False,
+        )
+        batch = next(iter(loader))
+        _validate_multimodal_pretrain_batch(batch)
+        logging.info(
+            "Multimodal pretraining batch ready: sar=%s optical=%s valid_mask=%s strict=%s samples=%s",
+            tuple(batch["sar"].shape),
+            tuple(batch["optical"].shape),
+            tuple(batch["valid_mask"].shape),
+            dataset.strict_pairing,
+            len(batch["meta"]),
+        )
+        raise SystemExit(0)
+
     require_active_binary_mode(args.classes, "train.py")
+    if not args.img_dir or not args.mask_dir:
+        raise ValueError("--img-dir and --mask-dir are required for the SAR training path")
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
