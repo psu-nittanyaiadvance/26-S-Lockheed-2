@@ -106,9 +106,8 @@ class DeCUR(nn.Module):
             - batch_size (int): Batch size per GPU (used for correlation normalization)
     """
 
-    def __init__(self, args):
+    def __init__(self):
         super().__init__()
-        self.args = args
 
         # Encoders — one per modality
         self.encoder_SAR = UNetEncoder(n_channels=2)
@@ -131,71 +130,6 @@ class DeCUR(nn.Module):
         layers.append(nn.Linear(sizes[-2], sizes[-1], bias=False))
         return nn.Sequential(*layers)
     
-    def bt_loss_cross(self, z1, z2):
-        """
-        Cross-modal decoupled loss — the core of DeCUR.
-
-        Splits the correlation matrix into common and unique submatrices:
-            - Common dims → target is identity (correlate across modalities)
-            - Unique dims → target is zero (decorrelate across modalities)
-
-        Args:
-            z1: SAR embeddings, shape (batch_size, 8192)
-            z2: Optical embeddings, shape (batch_size, 8192)
-
-        Returns:
-            Tuple of (loss_c, on_diag_c, off_diag_c, loss_u, on_diag_u, off_diag_u)
-        """
-        # Cross-correlation matrix between SAR and optical embeddings
-        c = self.bn(z1).T @ self.bn(z2)
-
-        # Normalize across all GPUs
-        c.div_(self.args.batch_size * 4)
-        torch.distributed.all_reduce(c)
-
-        # Split into common and unique submatrices
-        dim_c = self.args.dim_common
-        c_c = c[:dim_c, :dim_c]   # common submatrix
-        c_u = c[dim_c:, dim_c:]   # unique submatrix
-
-        # COMMON LOSS: drive toward identity (C_ii → 1, C_ij → 0)
-        on_diag_c = torch.diagonal(c_c).add_(-1).pow_(2).sum()
-        off_diag_c = off_diagonal(c_c).pow_(2).sum()
-        loss_c = on_diag_c + self.args.lambd * off_diag_c
-
-        # UNIQUE LOSS: drive toward zero (C_ii → 0, C_ij → 0)
-        on_diag_u = torch.diagonal(c_u).pow_(2).sum()
-        off_diag_u = off_diagonal(c_u).pow_(2).sum()
-        loss_u = on_diag_u + self.args.lambd * off_diag_u
-
-        return loss_c, on_diag_c, off_diag_c, loss_u, on_diag_u, off_diag_u
-
-    def bt_loss_single(self, z1, z2):
-        """
-        Intra-modal Barlow Twins loss for a single modality.
-
-        Standard Barlow Twins on ALL dimensions (common + unique).
-        Prevents unique dimensions from collapsing by forcing them to
-        encode meaningful, augmentation-invariant information.
-
-        Args:
-            z1: Embeddings from augmented view 1, shape (batch_size, 8192)
-            z2: Embeddings from augmented view 2, shape (batch_size, 8192)
-
-        Returns:
-            Tuple of (loss, on_diag, off_diag)
-        """
-        c = self.bn(z1).T @ self.bn(z2)
-
-        c.div_(self.args.batch_size * 4)
-        torch.distributed.all_reduce(c)
-
-        # Target: identity (all dims invariant to augmentation, all decorrelated)
-        on_diag = torch.diagonal(c).add_(-1).pow_(2).sum()
-        off_diag = off_diagonal(c).pow_(2).sum()
-        loss = on_diag + self.args.lambd * off_diag
-
-        return loss, on_diag, off_diag
 
     def forward(self, y1_1, y1_2, y2_1, y2_2):
         """

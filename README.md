@@ -1,31 +1,25 @@
-# SAR Flood Segmentation (Baseline)
+# DeCUR Training Engine
 
-This repo is a minimal SAR-only baseline for flood segmentation using the
-Sen1Floods11 subset filtered to the Indian subcontinent. All masks are
-ground-truth (strong or weak labels only). Training uses 256x256 patches with
-20% overlap via `PatchDataset`.
+This repo now includes a top-level multimodal DeCUR training engine at
+`src/train.py`. It covers the four training-orchestration responsibilities:
+
+1. paired SAR and optical data ingestion,
+2. forward/backward execution with AMP and gradient accumulation,
+3. validation-time representation tracking,
+4. checkpointing, scheduler updates, and logging.
 
 **Repo Structure**
 
-```
+```text
 .
-├── datasets/
-│   └── FilteredSouthAsia/
-│       ├── WeaklyLabeled/
-│       │   ├── S1Weak/
-│       │   └── S1OtsuLabelWeak/
-│       └── HandLabeled/
-│           ├── S1Hand/
-│           └── LabelHand/
-├── scripts/
-│   ├── export_patches.py
-│   └── forward_pass_augmented.py
-└── src/
-    ├── data_loader/
-    │   ├── sar_dataset.py
-    │   ├── patch_dataset.py
-    │   └── README.md
-    └── train.py
+|-- src/
+|   |-- data_loader/
+|   |-- models/decur/
+|   |-- Multi_modal_src/DeCURLoss.py
+|   |-- eval.py
+|   `-- train.py
+|-- scripts/
+`-- tests/
 ```
 
 **Quickstart (PowerShell)**
@@ -44,14 +38,30 @@ py -m pip install --upgrade pip
 py -m pip install -r requirements.txt
 ```
 
-3. Train (patching is automatic in `src/train.py`):
+3. Launch DeCUR pretraining:
 
 ```powershell
-python src/train.py --img-dir "datasets/FilteredSouthAsia/HandLabeled/S1Hand" `
-  --mask-dir "datasets\FilteredSouthAsia\HandLabeled\S1OtsuLabelHand" `
-  --epochs 20 --batch-size 8 --learning-rate 1e-4 --validation 10 --classes 1
+python src/train.py `
+  --combined-root "datasets/FilteredSouthAsia/Combined" `
+  --epochs 20 `
+  --batch-size 4 `
+  --learning-rate 1e-4 `
+  --validation-split 0.1 `
+  --patch-size 256 `
+  --patch-overlap 0.2 `
+  --amp `
+  --output-dir "runs/decur_pretrain"
 ```
+
+**What The Engine Does**
+
+- Loads strict SAR/optical pairs from the combined manifest via `FusedDataset`.
+- Optionally expands training samples with `PatchDataset`.
+- Builds two augmented views per modality for the DeCUR objective.
+- Tracks train loss, validation loss, cross-modal cosine alignment, view consistency, learning rate, and embedding norms.
+- Writes checkpoints to `runs/.../checkpoints/{last,best}.pt`.
+- Writes TensorBoard logs to `runs/.../logs` when TensorBoard is installed.
 
 **Data Loader**
 
-See `src/data_loader/README.md` for dataset usage and patching details.
+See `src/data_loader/README.md` for dataset details and patching behavior.
