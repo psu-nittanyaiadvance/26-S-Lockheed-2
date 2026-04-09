@@ -43,6 +43,7 @@ dist/
 experiments/
 
 .pytest_cache/
+.pytest_tmp/
 .torch_cache/
 .tmp/
 

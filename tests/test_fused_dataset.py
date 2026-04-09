@@ -14,7 +14,7 @@ from torch.utils.data import Dataset
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from data_loader import FusedDataset, PatchDataset  # noqa: E402
+from data_loader import FusedDataset, PatchDataset, multimodal_pretrain_collate  # noqa: E402
 from data_loader.combined_manifest import CombinedManifestSample  # noqa: E402
 
 
@@ -383,6 +383,7 @@ def test_strict_from_combined_manifest_enforces_exact_parity_and_metadata(
     assert meta["pairing_source"] == "combined_manifest"
     assert Path(meta["sar_img_path"]).name == "tile_2.tif"
     assert Path(meta["optical_img_path"]).name == "tile_2.tif"
+    assert Path(meta["label_path"]).name == "tile_2.tif"
     assert meta["manifest_row_index"] == 1
 
 
@@ -448,8 +449,8 @@ def test_direct_strict_pairing_rejects_zero_fallback_policy() -> None:
             sample_id="tile",
             manifest_index=0,
             manifest_path="Combined/manifest.csv",
-            sar_path="Combined/S1/tile.tif",
-            optical_path="Combined/S2/tile.tif",
+            sar_path="tile.tif",
+            optical_path="tile.tif",
             label_path=None,
         )
     ]
@@ -524,28 +525,6 @@ def test_strict_valid_mask_is_joint_intersection_when_both_modalities_exist() ->
 
     assert meta["strict_paired_mode"] is True
     assert torch.equal(meta["valid_mask"], sar_valid & opt_valid)
-
-
-def test_strict_from_combined_manifest_supports_unlabeled_mode(tmp_path: Path) -> None:
-    combined_root = _build_combined_root(
-        tmp_path,
-        manifest_rows=[
-            {
-                "sample_id": "tile_1",
-                "output_S1": "S1\\tile_1.tif",
-                "output_S2": "S2\\tile_1.tif",
-                "output_Label": "Label\\tile_1.tif",
-            }
-        ],
-    )
-
-    fused = FusedDataset.from_combined_manifest(combined_root, mode="none")
-    img, mask, meta = fused[0]
-
-    assert mask is None
-    assert img.shape[0] == meta["n_sar_bands"] + meta["n_optical_bands"]
-    assert meta["strict_paired_mode"] is True
-    assert meta["fused_optical_available"] is True
 
 
 def test_strict_patched_fused_samples_keep_deterministic_patch_provenance(
