@@ -6,7 +6,6 @@ import logging
 import random
 import time
 from pathlib import Path
-from types import SimpleNamespace
 from typing import Any, Dict, Optional
 
 import torch
@@ -15,10 +14,10 @@ from torch.utils.data import DataLoader, Dataset, random_split
 from tqdm import tqdm
 import torch_optimizer as t_o
 
-from Multi_modal_src.DeCURLoss import DeCURLoss
-from data_loader import FusedDataset, PatchDataset, build_train_transforms, build_val_transforms
+from DeCURLoss import DeCURLoss
+from ..data_loader import FusedDataset, PatchDataset, build_train_transforms, build_val_transforms
 from eval import evaluate_decur
-from models.decur.model import DeCUR
+from ..models.decur.model import DeCUR
 
 try:
     from torch.utils.tensorboard import SummaryWriter
