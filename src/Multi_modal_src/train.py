@@ -7,7 +7,7 @@ import random
 import sys
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Optional
 
 import torch
 from torch import optim
@@ -70,103 +70,6 @@ def move_to_device(value: Any, device: torch.device) -> Any:
     return value
 
 
-def _grid_starts(length: int, patch: int, stride: int) -> List[int]:
-    if patch >= length:
-        return [0]
-    starts: List[int] = list(range(0, length - patch, stride))
-    last = length - patch
-    if not starts or starts[-1] < last:
-        starts.append(last)
-    return starts
-
-
-class _PatchIndex:
-    __slots__ = ("base_idx", "row", "col", "y0", "x0")
-
-    def __init__(self, base_idx: int, row: int, col: int, y0: int, x0: int) -> None:
-        self.base_idx = base_idx
-        self.row = row
-        self.col = col
-        self.y0 = y0
-        self.x0 = x0
-
-
-class PairedPatchDataset(Dataset):
-    def __init__(self, base_dataset: Dataset, patch_size: int = 256, overlap: float = 0.2) -> None:
-        if not (0.0 <= overlap < 1.0):
-            raise ValueError(f"overlap must be in [0, 1); got {overlap}")
-        if patch_size < 1:
-            raise ValueError(f"patch_size must be >= 1; got {patch_size}")
-
-        self.base_dataset = base_dataset
-        self.patch_size = patch_size
-        self.overlap = overlap
-        self.stride = max(1, int(torch.ceil(torch.tensor(patch_size * (1.0 - overlap))).item()))
-        self._index = self._build_index()
-
-    def _build_index(self) -> List[_PatchIndex]:
-        index: List[_PatchIndex] = []
-        for base_idx in range(len(self.base_dataset)):  # type: ignore[arg-type]
-            sample = self.base_dataset[base_idx]
-            sar = sample["sar"]
-            optical = sample["optical"]
-            if tuple(sar.shape[-2:]) != tuple(optical.shape[-2:]):
-                raise ValueError(
-                    "SAR and optical spatial dims must match before patching; "
-                    f"got SAR {tuple(sar.shape)} and optical {tuple(optical.shape)}"
-                )
-
-            height, width = sar.shape[-2:]
-            for row, y0 in enumerate(_grid_starts(height, self.patch_size, self.stride)):
-                for col, x0 in enumerate(_grid_starts(width, self.patch_size, self.stride)):
-                    index.append(_PatchIndex(base_idx, row, col, y0, x0))
-
-        if not index:
-            raise ValueError("PairedPatchDataset index is empty")
-        return index
-
-    def __len__(self) -> int:
-        return len(self._index)
-
-    def __getitem__(self, idx: int) -> Dict[str, Any]:
-        patch_index = self._index[idx]
-        sample = self.base_dataset[patch_index.base_idx]
-        patch_size = self.patch_size
-        y0, x0 = patch_index.y0, patch_index.x0
-
-        sar_patch = sample["sar"][:, y0 : y0 + patch_size, x0 : x0 + patch_size]
-        optical_patch = sample["optical"][:, y0 : y0 + patch_size, x0 : x0 + patch_size]
-        valid_mask = sample["valid_mask"]
-        if not isinstance(valid_mask, torch.Tensor):
-            valid_mask = torch.as_tensor(valid_mask)
-        if valid_mask.ndim == 3 and valid_mask.shape[0] == 1:
-            valid_mask = valid_mask[:, y0 : y0 + patch_size, x0 : x0 + patch_size]
-        elif valid_mask.ndim == 2:
-            valid_mask = valid_mask[y0 : y0 + patch_size, x0 : x0 + patch_size]
-        else:
-            raise ValueError(
-                "paired valid_mask must have shape [H,W] or [1,H,W]; "
-                f"got {tuple(valid_mask.shape)}"
-            )
-
-        meta = dict(sample["meta"])
-        base_id = str(meta.get("id", f"base_{patch_index.base_idx}"))
-        meta["id"] = f"{base_id}_r{patch_index.row}_c{patch_index.col}"
-        meta["base_id"] = base_id
-        meta["patch_row"] = patch_index.row
-        meta["patch_col"] = patch_index.col
-        meta["patch_y0"] = y0
-        meta["patch_x0"] = x0
-        meta["patch_size"] = patch_size
-
-        return {
-            "sar": sar_patch,
-            "optical": optical_patch,
-            "valid_mask": valid_mask,
-            "meta": meta,
-        }
-
-
 def _require_supported_channel_config(args: argparse.Namespace) -> None:
     if args.sar_channels != MODEL_SAR_CHANNELS or args.optical_channels != MODEL_OPTICAL_CHANNELS:
         raise ValueError(
@@ -202,17 +105,7 @@ def build_datasets(args: argparse.Namespace) -> tuple[Dataset, Optional[Dataset]
     generator = torch.Generator().manual_seed(args.seed)
     train_base, val_base = random_split(fused_dataset, [train_size, val_size], generator=generator)
 
-    train_source: Dataset = train_base
-    val_source: Optional[Dataset] = val_base if val_size > 0 else None
-
-    if args.patch_size > 0:
-        # Patch after the split so patches from the same parent tile do not
-        # leak across train and validation.
-        train_source = PairedPatchDataset(train_source, patch_size=args.patch_size, overlap=args.patch_overlap)
-        if val_source is not None:
-            val_source = PairedPatchDataset(val_source, patch_size=args.patch_size, overlap=args.patch_overlap)
-
-    return train_source, val_source
+    return train_base, val_base if val_size > 0 else None
 
 
 def create_writer(output_dir: Path):
@@ -262,10 +155,9 @@ def train_model(args: argparse.Namespace) -> None:
 
     train_dataset, val_dataset = build_datasets(args)
     logging.info(
-        "Dataset ready: train_samples=%s val_samples=%s patch_size=%s",
+        "Dataset ready: train_samples=%s val_samples=%s",
         len(train_dataset),
         0 if val_dataset is None else len(val_dataset),
-        args.patch_size,
     )
 
     loader_kwargs = {
@@ -461,8 +353,6 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--common-dim", type=int, default=1792, help="Number of common embedding dimensions")
 
     parser.add_argument("--lambda-param", type=float, default=0.0051, help="Off-diagonal penalty weight")
-    parser.add_argument("--patch-size", type=int, default=256, help="Patch size; <=0 uses full tiles")
-    parser.add_argument("--patch-overlap", type=float, default=0.2, help="Patch overlap fraction in [0,1)")
     parser.add_argument("--sar-channels", type=int, default=2, help="Expected SAR band count")
     parser.add_argument("--optical-channels", type=int, default=13, help="Expected optical band count")
     parser.add_argument("--optical-clip-percentile", type=float, default=2.0, help="Optical robust clipping percentile")
@@ -472,8 +362,6 @@ def get_args() -> argparse.Namespace:
 
     if not 0.0 <= args.validation_split < 1.0:
         raise ValueError("--validation-split must be in [0,1)")
-    if not 0.0 <= args.patch_overlap < 1.0:
-        raise ValueError("--patch-overlap must be in [0,1)")
     if args.common_dim < 1:
         raise ValueError("--common-dim must be >= 1")
     return args
