@@ -114,7 +114,7 @@ class DeCUR(nn.Module):
         self.encoder_OPT = UNetEncoder(n_channels=13)
 
         # Projectors — independent weights per modality
-        sizes = [1024, 8192, 8192, 8192]
+        sizes = [1024, 2048, 2048, 2048]
         self.projector_SAR = self._build_projector(sizes)
         self.projector_OPT = self._build_projector(sizes)
 
