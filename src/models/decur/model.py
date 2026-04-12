@@ -154,12 +154,12 @@ class DeCUR(nn.Module):
         f2_2 = self.encoder_OPT(y2_2)   # Optical view 2 → (batch, 1024)
 
         
-        # STEP 2: Project — into 8192-dim embedding space
+        # STEP 2: Project — into 2048-dim embedding space
         
-        z1_1 = self.projector_SAR(f1_1)  # (batch, 8192)
-        z1_2 = self.projector_SAR(f1_2)  # (batch, 8192)
-        z2_1 = self.projector_OPT(f2_1)  # (batch, 8192)
-        z2_2 = self.projector_OPT(f2_2)  # (batch, 8192)
+        z1_1 = self.projector_SAR(f1_1)  # (batch, 2048)
+        z1_2 = self.projector_SAR(f1_2)  # (batch, 2048)
+        z2_1 = self.projector_OPT(f2_1)  # (batch, 2048)
+        z2_2 = self.projector_OPT(f2_2)  # (batch, 2048)
 
         
     
