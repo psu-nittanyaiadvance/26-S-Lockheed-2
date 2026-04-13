@@ -256,7 +256,7 @@ def train_model(args: argparse.Namespace) -> None:
                     views["opt_view_1"],
                     views["opt_view_2"],
                 )
-                loss = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)
+                loss, metrics = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)
 
             scaler.scale(loss).backward()
             
@@ -274,6 +274,10 @@ def train_model(args: argparse.Namespace) -> None:
             global_step += 1
 
             writer.add_scalar("train/loss_step", current_loss, global_step)
+            writer.add_scalar("train/SAR_intra_loss_step", metrics["intra1"].item(), global_step)
+            writer.add_scalar("train/optical_intra_loss_step", metrics["intra2"].item(), global_step)
+            writer.add_scalar("train/unique_inter_loss_step", metrics["interUnique"].item(), global_step)
+            writer.add_scalar("train/common_inter_loss_step", metrics["interCommon"].item(), global_step)
             progress.set_postfix(loss=f"{current_loss:.4f}")
 
         # 2. OUTER LOOP (Epoch-level Metrics & Validation)
