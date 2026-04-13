@@ -49,6 +49,7 @@ from __future__ import annotations
 
 import math
 import warnings
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -81,6 +82,32 @@ def _tile_shape(img_path: str) -> Tuple[int, int]:
     """Read (H, W) from a rasterio-readable file without loading pixels."""
     with rasterio.open(img_path) as src:
         return src.height, src.width
+
+
+def _dataset_has_transforms(dataset: Dataset) -> bool:
+    if getattr(dataset, "transforms", None) is not None:
+        return True
+    child = getattr(dataset, "dataset", None)
+    if child is not None:
+        return _dataset_has_transforms(child)
+    return False
+
+
+def _dataset_image_path(dataset: Dataset, idx: int) -> Optional[str]:
+    child = getattr(dataset, "dataset", None)
+    indices = getattr(dataset, "indices", None)
+    if child is not None and indices is not None:
+        return _dataset_image_path(child, int(indices[idx]))
+
+    samples = getattr(dataset, "samples", None)
+    if samples is not None:
+        return str(samples[idx].get("img_path", "")) or None
+
+    sar_dataset = getattr(dataset, "sar_dataset", None)
+    if sar_dataset is not None:
+        return _dataset_image_path(sar_dataset, idx)
+
+    return None
 
 
 # ── PatchIndex ───────────────────────────────────────────────────────────────
@@ -132,6 +159,7 @@ class PatchDataset(Dataset):
         overlap: float = 0.2,
         skip_mostly_nodata: bool = False,
         nodata_threshold: float = 0.0,
+        processed_tile_cache_size: int = 32,
     ) -> None:
         if not (0.0 <= overlap < 1.0):
             raise ValueError(f"overlap must be in [0, 1); got {overlap}")
@@ -143,6 +171,15 @@ class PatchDataset(Dataset):
         self.overlap = overlap
         self.skip_mostly_nodata = skip_mostly_nodata
         self.nodata_threshold = nodata_threshold
+        self.processed_tile_cache_size = int(processed_tile_cache_size)
+        self._cache_processed_tiles = (
+            self.processed_tile_cache_size > 0
+            and not _dataset_has_transforms(base_dataset)
+        )
+        self._processed_tile_cache: OrderedDict[
+            int,
+            Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]],
+        ] = OrderedDict()
 
         stride = max(1, int(math.ceil(patch_size * (1.0 - overlap))))
         self.stride = stride
@@ -157,8 +194,14 @@ class PatchDataset(Dataset):
 
         for base_idx in range(len(base)):  # type: ignore[arg-type]
             try:
-                _, _, meta = base[base_idx]
-                img_path = meta.get("img_path", "")
+                img_path = _dataset_image_path(base, base_idx)
+                if img_path is None:
+                    item = base[base_idx]
+                    if isinstance(item, dict):
+                        meta = item.get("meta", {})
+                    else:
+                        _, _, meta = item
+                    img_path = meta.get("img_path", "") or meta.get("sar_img_path", "")
                 if not img_path:
                     warnings.warn(
                         f"Sample at index {base_idx} has no 'img_path' in metadata; "
@@ -192,22 +235,41 @@ class PatchDataset(Dataset):
     def __len__(self) -> int:
         return len(self._index)
 
+    def _get_base_item(
+        self,
+        base_idx: int,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
+        if not self._cache_processed_tiles:
+            return self.base_dataset[base_idx]
+
+        cached = self._processed_tile_cache.get(base_idx)
+        if cached is not None:
+            self._processed_tile_cache.move_to_end(base_idx)
+            return cached
+
+        item = self.base_dataset[base_idx]
+        self._processed_tile_cache[base_idx] = item
+        self._processed_tile_cache.move_to_end(base_idx)
+        while len(self._processed_tile_cache) > self.processed_tile_cache_size:
+            self._processed_tile_cache.popitem(last=False)
+        return item
+
     def __getitem__(
         self, idx: int
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
         pi = self._index[idx]
-        img_tensor, mask_tensor, meta = self.base_dataset[pi.base_idx]
+        img_tensor, mask_tensor, meta = self._get_base_item(pi.base_idx)
 
         ps = self.patch_size
         y0, x0 = pi.y0, pi.x0
 
         # Crop image: [C, H, W] → [C, ps, ps]
-        img_patch = img_tensor[:, y0 : y0 + ps, x0 : x0 + ps]
+        img_patch = img_tensor[:, y0 : y0 + ps, x0 : x0 + ps].clone()
 
         # Crop mask (if present): [1, H, W] → [1, ps, ps]
         mask_patch: Optional[torch.Tensor] = None
         if mask_tensor is not None:
-            mask_patch = mask_tensor[:, y0 : y0 + ps, x0 : x0 + ps]
+            mask_patch = mask_tensor[:, y0 : y0 + ps, x0 : x0 + ps].clone()
 
         # Extend metadata
         patch_meta: Dict[str, Any] = dict(meta)
@@ -230,9 +292,9 @@ class PatchDataset(Dataset):
                             "valid_mask must have shape [H,W] or [1,H,W]; "
                             f"got {tuple(valid_mask.shape)}"
                         )
-                    patch_meta["valid_mask"] = valid_mask[:, y0 : y0 + ps, x0 : x0 + ps]
+                    patch_meta["valid_mask"] = valid_mask[:, y0 : y0 + ps, x0 : x0 + ps].clone()
                 elif valid_mask.ndim == 2:
-                    patch_meta["valid_mask"] = valid_mask[y0 : y0 + ps, x0 : x0 + ps]
+                    patch_meta["valid_mask"] = valid_mask[y0 : y0 + ps, x0 : x0 + ps].clone()
                 else:
                     base_id = meta.get("id", f"base_{pi.base_idx}")
                     raise ValueError(
@@ -246,9 +308,9 @@ class PatchDataset(Dataset):
                 if not isinstance(ignore_mask, torch.Tensor):
                     ignore_mask = torch.as_tensor(ignore_mask)
                 if ignore_mask.ndim == 3:
-                    patch_meta["ignore_mask"] = ignore_mask[:, y0 : y0 + ps, x0 : x0 + ps]
+                    patch_meta["ignore_mask"] = ignore_mask[:, y0 : y0 + ps, x0 : x0 + ps].clone()
                 elif ignore_mask.ndim == 2:
-                    patch_meta["ignore_mask"] = ignore_mask[y0 : y0 + ps, x0 : x0 + ps]
+                    patch_meta["ignore_mask"] = ignore_mask[y0 : y0 + ps, x0 : x0 + ps].clone()
                 else:
                     base_id = meta.get("id", f"base_{pi.base_idx}")
                     raise ValueError(

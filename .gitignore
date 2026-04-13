@@ -18,6 +18,7 @@ datasets/
 outputs/
 checkpoints/
 runs/
+cache/
 wandb/
 mlruns/
 
