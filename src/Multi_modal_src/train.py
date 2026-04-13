@@ -115,6 +115,22 @@ def create_writer(output_dir: Path):
     return SummaryWriter(log_dir=str(output_dir / "logs"))
 
 
+def add_scalar_metric_if_present(
+    writer: Any,
+    tag: str,
+    metrics: Dict[str, Any],
+    key: str,
+    step: int,
+    aliases: tuple[str, ...] = (),
+) -> None:
+    # Loss-component metrics are optional across DeCUR loss variants.
+    for metric_key in (key, *aliases):
+        if metric_key in metrics:
+            value = metrics[metric_key]
+            writer.add_scalar(tag, value.item() if hasattr(value, "item") else value, step)
+            return
+
+
 def save_checkpoint(
     checkpoint_path: Path,
     *,
@@ -256,7 +272,14 @@ def train_model(args: argparse.Namespace) -> None:
                     views["opt_view_1"],
                     views["opt_view_2"],
                 )
-                loss = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)
+                loss_result = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)
+                if isinstance(loss_result, tuple):
+                    loss, loss_metrics = loss_result
+                    if not isinstance(loss_metrics, dict):
+                        raise TypeError("DeCURLoss returned metrics that are not a dict")
+                else:
+                    loss = loss_result
+                    loss_metrics = {}
 
             scaler.scale(loss).backward()
             
@@ -274,6 +297,17 @@ def train_model(args: argparse.Namespace) -> None:
             global_step += 1
 
             writer.add_scalar("train/loss_step", current_loss, global_step)
+            add_scalar_metric_if_present(writer, "train/SAR_intra_loss_step", loss_metrics, "intra1", global_step)
+            add_scalar_metric_if_present(writer, "train/optical_intra_loss_step", loss_metrics, "intra2", global_step)
+            add_scalar_metric_if_present(writer, "train/unique_inter_loss_step", loss_metrics, "interUnique", global_step)
+            add_scalar_metric_if_present(
+                writer,
+                "train/common_inter_loss_step",
+                loss_metrics,
+                "interCommon",
+                global_step,
+                aliases=("intraCommon",),
+            )
             progress.set_postfix(loss=f"{current_loss:.4f}")
 
         # 2. OUTER LOOP (Epoch-level Metrics & Validation)
