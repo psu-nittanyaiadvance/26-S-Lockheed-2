@@ -2,6 +2,7 @@
 numpy
 torch
 torchvision
+torch-optimizer
 tensorboard
 rasterio
 

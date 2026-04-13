@@ -207,12 +207,12 @@ def train_model(args: argparse.Namespace) -> None:
     param_groups = [
         {
             'params': regular_params,
-            'lr': 0.2,            # Base weights LR
+            'lr': 0.05,            # Base weights LR
             'weight_decay': 1e-6, # Base weight decay
         },
         {
             'params': bias_bn_params,
-            'lr': 0.0048,         # Bias/BN LR
+            'lr': 0.0012,         # Bias/BN LR
             'weight_decay': 0.0,  # Exclude from weight decay
         }
     ]
@@ -284,6 +284,15 @@ def train_model(args: argparse.Namespace) -> None:
         # The paper uses a Cosine Decay Schedule 
         # Stepping here ensures the decay happens after all batches in the epoch
         scheduler.step() 
+
+        # get_last_lr() returns a list of learning rates corresponding to your param_groups
+        current_lrs = scheduler.get_last_lr()
+        
+        # Log the learning rate for the regular parameters (Index 0)
+        writer.add_scalar("train/lr_base", current_lrs[0], epoch)
+        
+        # Log the learning rate for the Bias/BatchNorm parameters (Index 1)
+        writer.add_scalar("train/lr_bias_bn", current_lrs[1], epoch)
 
         if val_loader is not None:
             # Evaluation follows the same protocol of frozen encoder/fine-tuning checks 
