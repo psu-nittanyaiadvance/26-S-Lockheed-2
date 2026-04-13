@@ -24,8 +24,15 @@ class DeCURLoss(nn.Module):
         # 4. Inter-modal Unique Loss (Target Zero for bottom-right) [cite: 117, 119]
         lu = self._loss_u(inter_c[self.common_dim:, self.common_dim:])
 
+        metrics_dict = {
+                        "intra1" : l1,
+                        "intra2" : l2,
+                        "interUnique" : lu,
+                        "intraCommon" : lc
+                        }
+
         # Total Loss: L = L_M1 + L_M2 + L_com + L_uni [cite: 131]
-        return l1 + l2 + lc + lu
+        return l1 + l2 + lc + lu, metrics_dict
 
     def off_diagonal(self, x): # Added self for instance method access
         """

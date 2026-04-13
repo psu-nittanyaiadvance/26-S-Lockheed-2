@@ -53,7 +53,9 @@ def evaluate_decur(
                 batch["opt_view_1"],
                 batch["opt_view_2"],
             )
-            loss = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)
+
+            #indexed to only include the loss value
+            loss = loss_fn(z_sar_1, z_sar_2, z_opt_1, z_opt_2)[0]
 
         # These metrics are simple but readable:
         # full/common cross-modal cosine tells us whether SAR and optical
