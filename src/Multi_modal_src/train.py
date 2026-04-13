@@ -20,7 +20,16 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "models"))
 
 from Multi_modal_src.DeCURLoss import DeCURLoss
 from Multi_modal_src.eval import build_decur_batch_views, evaluate_decur
-from data_loader import FusedDataset, build_train_transforms, build_val_transforms, multimodal_pretrain_collate
+from data_loader import (
+    CachedPairedDataset,
+    FusedDataset,
+    build_paired_preprocessed_cache,
+    build_paired_preprocessing_config,
+    build_train_transforms,
+    build_val_transforms,
+    multimodal_pretrain_collate,
+    validate_paired_cache_parity,
+)
 from decur.model import DeCUR
 
 try:
@@ -79,26 +88,103 @@ def _require_supported_channel_config(args: argparse.Namespace) -> None:
         )
 
 
-def build_datasets(args: argparse.Namespace) -> tuple[Dataset, Optional[Dataset]]:
-    _require_supported_channel_config(args)
-
-    # Strict manifest loading guarantees SAR and optical stay paired in the
-    # same canonical order before any random train/val split happens.
-    fused_dataset = FusedDataset.from_combined_manifest(
-        args.combined_root,
-        mode="none",
-        return_mode="paired",
-        sar_dataset_kwargs={
+def _paired_dataset_kwargs(args: argparse.Namespace) -> tuple[Dict[str, Any], Dict[str, Any]]:
+    return (
+        {
             "log_transform": args.sar_log_transform,
             "expected_img_bands": args.sar_channels,
         },
-        optical_dataset_kwargs={
+        {
             "expected_img_bands": args.optical_channels,
             "reflectance_clip_percentile": args.optical_clip_percentile,
         },
+    )
+
+
+def _build_live_paired_dataset(args: argparse.Namespace) -> FusedDataset:
+    sar_dataset_kwargs, optical_dataset_kwargs = _paired_dataset_kwargs(args)
+    return FusedDataset.from_combined_manifest(
+        args.combined_root,
+        mode="none",
+        return_mode="paired",
+        sar_dataset_kwargs=sar_dataset_kwargs,
+        optical_dataset_kwargs=optical_dataset_kwargs,
         require_spatial_match=True,
         validate=args.validate_manifest,
     )
+
+
+def build_datasets(args: argparse.Namespace) -> tuple[Dataset, Optional[Dataset]]:
+    _require_supported_channel_config(args)
+    sar_dataset_kwargs, optical_dataset_kwargs = _paired_dataset_kwargs(args)
+    cache_config = build_paired_preprocessing_config(
+        args.combined_root,
+        sar_dataset_kwargs=sar_dataset_kwargs,
+        optical_dataset_kwargs=optical_dataset_kwargs,
+        require_spatial_match=True,
+        validate_manifest=args.validate_manifest,
+    )
+    cache_digest = cache_config["preprocessing_config_digest"]
+
+    if args.build_paired_cache and not args.paired_cache_dir:
+        raise ValueError("--build-paired-cache requires --paired-cache-dir")
+
+    live_dataset: Optional[FusedDataset] = None
+    if args.paired_cache_dir and not args.build_paired_cache:
+        fused_dataset: Dataset = CachedPairedDataset(
+            args.paired_cache_dir,
+            expected_preprocessing_config_digest=cache_digest,
+        )
+        logging.info(
+            "Using paired preprocessed cache: %s digest=%s",
+            args.paired_cache_dir,
+            cache_digest[:12],
+        )
+        if args.paired_cache_validate_samples > 0:
+            live_dataset = _build_live_paired_dataset(args)
+    else:
+        # Strict manifest loading guarantees SAR and optical stay paired in the
+        # same canonical order before any random train/val split happens.
+        live_dataset = _build_live_paired_dataset(args)
+        fused_dataset = live_dataset
+
+        if args.paired_cache_dir and args.build_paired_cache:
+            logging.info("Building paired preprocessed cache at: %s", args.paired_cache_dir)
+            build_paired_preprocessed_cache(
+                live_dataset,
+                args.paired_cache_dir,
+                preprocessing_config=cache_config,
+                max_samples=args.paired_cache_max_samples,
+                overwrite=args.paired_cache_overwrite,
+            )
+            fused_dataset = CachedPairedDataset(
+                args.paired_cache_dir,
+                expected_preprocessing_config_digest=cache_digest,
+            )
+            logging.info(
+                "Built paired preprocessed cache: samples=%s digest=%s",
+                len(fused_dataset),
+                cache_digest[:12],
+            )
+
+    if args.paired_cache_validate_samples > 0:
+        if live_dataset is None:
+            live_dataset = _build_live_paired_dataset(args)
+        if not isinstance(fused_dataset, CachedPairedDataset):
+            logging.warning("--paired-cache-validate-samples was set, but no cached dataset is active.")
+        else:
+            n_check = min(args.paired_cache_validate_samples, len(live_dataset), len(fused_dataset))
+            parity = validate_paired_cache_parity(
+                live_dataset,
+                fused_dataset,
+                indices=range(n_check),
+            )
+            if not parity["ok"]:
+                raise ValueError(
+                    "Paired cache parity validation failed: "
+                    + "; ".join(parity["mismatches"][:10])
+                )
+            logging.info("Paired cache parity validated: samples=%s", parity["checked"])
 
     val_size = int(len(fused_dataset) * args.validation_split)
     train_size = len(fused_dataset) - val_size
@@ -159,6 +245,9 @@ def train_model(args: argparse.Namespace) -> None:
         len(train_dataset),
         0 if val_dataset is None else len(val_dataset),
     )
+    if args.cache_only:
+        logging.info("--cache-only set; exiting after paired cache preparation.")
+        return
 
     loader_kwargs = {
         "batch_size": args.batch_size,
@@ -367,12 +456,51 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--optical-clip-percentile", type=float, default=2.0, help="Optical robust clipping percentile")
     parser.add_argument("--sar-log-transform", action="store_true", help="Apply SAR log transform in the dataset loader")
     parser.add_argument("--validate-manifest", action="store_true", help="Validate paired manifest assets before training")
+    parser.add_argument(
+        "--paired-cache-dir",
+        type=str,
+        default=None,
+        help="Experimental paired preprocessed tensor cache directory to build or read",
+    )
+    parser.add_argument(
+        "--build-paired-cache",
+        action="store_true",
+        help="Build --paired-cache-dir from the live raster-backed paired dataset before training",
+    )
+    parser.add_argument(
+        "--paired-cache-overwrite",
+        action="store_true",
+        help="Overwrite an existing paired cache index when --build-paired-cache is set",
+    )
+    parser.add_argument(
+        "--paired-cache-max-samples",
+        type=int,
+        default=None,
+        help="Optional pilot limit for cache generation; omit to cache the full paired manifest",
+    )
+    parser.add_argument(
+        "--paired-cache-validate-samples",
+        type=int,
+        default=0,
+        help="Compare this many cached samples against the live raster path before training",
+    )
+    parser.add_argument(
+        "--cache-only",
+        action="store_true",
+        help="Build/validate the paired cache and exit before model construction",
+    )
     args = parser.parse_args()
 
     if not 0.0 <= args.validation_split < 1.0:
         raise ValueError("--validation-split must be in [0,1)")
     if args.common_dim < 1:
         raise ValueError("--common-dim must be >= 1")
+    if args.paired_cache_max_samples is not None and args.paired_cache_max_samples < 0:
+        raise ValueError("--paired-cache-max-samples must be non-negative")
+    if args.paired_cache_validate_samples < 0:
+        raise ValueError("--paired-cache-validate-samples must be non-negative")
+    if args.cache_only and not args.build_paired_cache:
+        raise ValueError("--cache-only requires --build-paired-cache")
     return args
 
 

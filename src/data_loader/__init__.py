@@ -2,6 +2,12 @@ from .combined_manifest import load_combined_manifest_samples
 from .sar_dataset import SARDataset
 from .optical_dataset import OpticalDataset
 from .fused_dataset import FusedDataset
+from .paired_cache import (
+    CachedPairedDataset,
+    build_paired_preprocessed_cache,
+    build_paired_preprocessing_config,
+    validate_paired_cache_parity,
+)
 from .splits import make_split
 from .stats import compute_running_mean_std
 from .collate import default_collate, multimodal_pretrain_collate
@@ -19,8 +25,12 @@ __all__ = [
     "SARDataset",
     "OpticalDataset",
     "FusedDataset",
+    "CachedPairedDataset",
     "PatchDataset",
     "load_combined_manifest_samples",
+    "build_paired_preprocessed_cache",
+    "build_paired_preprocessing_config",
+    "validate_paired_cache_parity",
     # Splits
     "make_split",
     # Stats
