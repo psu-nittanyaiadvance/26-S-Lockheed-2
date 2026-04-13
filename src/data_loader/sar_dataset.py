@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import os
+import time
 import warnings
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, TypedDict, Union
@@ -21,6 +23,8 @@ class Sample(TypedDict):
 
 
 NormalizeCfg = Union[str, Dict[str, Any], None]
+DEFAULT_QUANTILE_CACHE_ROOT = Path("cache") / "quantiles"
+_QUANTILE_CACHE_VERSION = 1
 
 
 def _is_tif_name(name: str) -> bool:
@@ -47,6 +51,74 @@ def _infer_split_from_path(path: str) -> str:
         if token in parts:
             return token
     return "all"
+
+
+def _quantile_cache_path(
+    cache_root: Optional[Path],
+    dataset_type: str,
+    sample_id: str,
+    img_path: str,
+) -> Optional[Path]:
+    if cache_root is None:
+        return None
+    safe_id = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in sample_id)
+    digest = hashlib.sha1(str(Path(img_path).resolve()).encode("utf-8")).hexdigest()[:16]
+    return cache_root / dataset_type / f"{safe_id}_{digest}.pt"
+
+
+def _file_cache_fingerprint(img_path: str) -> Dict[str, Any]:
+    path = Path(img_path)
+    stat = path.stat()
+    return {
+        "path": str(path.resolve()),
+        "mtime_ns": int(stat.st_mtime_ns),
+        "size": int(stat.st_size),
+    }
+
+
+def _load_quantile_cache(
+    cache_path: Optional[Path],
+    expected_key: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    if cache_path is None or not cache_path.exists():
+        return None
+    try:
+        cached = torch.load(cache_path, map_location="cpu")
+    except Exception:
+        return None
+    if not isinstance(cached, dict) or cached.get("key") != expected_key:
+        return None
+    lower = cached.get("lower")
+    upper = cached.get("upper")
+    if not isinstance(lower, torch.Tensor) or not isinstance(upper, torch.Tensor):
+        return None
+    return cached
+
+
+def _save_quantile_cache(
+    cache_path: Optional[Path],
+    key: Dict[str, Any],
+    lower: torch.Tensor,
+    upper: torch.Tensor,
+    *,
+    extra: Optional[Dict[str, Any]] = None,
+) -> None:
+    if cache_path is None:
+        return
+    try:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        payload: Dict[str, Any] = {
+            "key": key,
+            "lower": lower.detach().cpu(),
+            "upper": upper.detach().cpu(),
+        }
+        if extra:
+            payload.update(extra)
+        tmp_path = cache_path.with_suffix(f"{cache_path.suffix}.{os.getpid()}.tmp")
+        torch.save(payload, tmp_path)
+        os.replace(tmp_path, cache_path)
+    except Exception as exc:
+        warnings.warn(f"Could not write quantile cache '{cache_path}': {exc}")
 
 
 class SARDataset(Dataset):
@@ -99,6 +171,7 @@ class SARDataset(Dataset):
         time_matched_missing_policy: str = "zeros",
         mask_id_suffix_map: Optional[Dict[str, str]] = None,
         expected_img_bands: Optional[int] = None,
+        quantile_cache_root: Optional[Union[str, Path]] = DEFAULT_QUANTILE_CACHE_ROOT,
         
     ) -> None:
         if mode not in {"weak", "strong", "none"}:
@@ -121,6 +194,21 @@ class SARDataset(Dataset):
         self.expected_img_bands = expected_img_bands
         if self.expected_img_bands is not None and self.expected_img_bands <= 0:
             raise ValueError("expected_img_bands must be a positive integer")
+        if os.environ.get("LOCKDOCKS_DISABLE_QUANTILE_CACHE") == "1":
+            quantile_cache_root = None
+        self.quantile_cache_root = (
+            Path(quantile_cache_root) if quantile_cache_root is not None else None
+        )
+        self._profile_quantiles = os.environ.get("LOCKDOCKS_PROFILE_QUANTILES") == "1"
+        self._quantile_profile: Dict[str, Any] = {
+            "load_image_calls": 0,
+            "load_image_seconds": 0.0,
+            "nanquantile_calls": 0,
+            "nanquantile_seconds": 0.0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "shapes": {},
+        }
 
         if not self.ids_are_paths:
             if self.img_root is None:
@@ -336,6 +424,62 @@ class SARDataset(Dataset):
 
         raise ValueError(f"Unknown normalization type: {self._normalize_type}")
 
+    def _record_quantile_shape(self, flat: torch.Tensor) -> None:
+        if not self._profile_quantiles:
+            return
+        shapes = self._quantile_profile["shapes"]
+        key = f"{tuple(flat.shape)} {flat.dtype} {flat.device}"
+        shapes[key] = int(shapes.get(key, 0)) + 1
+
+    def _record_nanquantile_time(self, flat: torch.Tensor, seconds: float) -> None:
+        if not self._profile_quantiles:
+            return
+        self._quantile_profile["nanquantile_calls"] += 1
+        self._quantile_profile["nanquantile_seconds"] += seconds
+        self._record_quantile_shape(flat)
+
+    def _record_cache_hit(self) -> None:
+        if self._profile_quantiles:
+            self._quantile_profile["cache_hits"] += 1
+
+    def _record_cache_miss(self) -> None:
+        if self._profile_quantiles:
+            self._quantile_profile["cache_misses"] += 1
+
+    def _record_load_image_time(self, started_at: Optional[float]) -> None:
+        if started_at is None or not self._profile_quantiles:
+            return
+        self._quantile_profile["load_image_calls"] += 1
+        self._quantile_profile["load_image_seconds"] += time.perf_counter() - started_at
+
+    def quantile_profile_summary(self, *, reset: bool = False) -> Dict[str, Any]:
+        """
+        Return lightweight dataloader quantile counters.
+
+        Enable collection with ``LOCKDOCKS_PROFILE_QUANTILES=1``. Call this at
+        epoch boundaries if per-epoch counters are needed.
+        """
+        summary = {
+            "load_image_calls": self._quantile_profile["load_image_calls"],
+            "load_image_seconds": self._quantile_profile["load_image_seconds"],
+            "nanquantile_calls": self._quantile_profile["nanquantile_calls"],
+            "nanquantile_seconds": self._quantile_profile["nanquantile_seconds"],
+            "cache_hits": self._quantile_profile["cache_hits"],
+            "cache_misses": self._quantile_profile["cache_misses"],
+            "shapes": dict(self._quantile_profile["shapes"]),
+        }
+        if reset:
+            self._quantile_profile = {
+                "load_image_calls": 0,
+                "load_image_seconds": 0.0,
+                "nanquantile_calls": 0,
+                "nanquantile_seconds": 0.0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "shapes": {},
+            }
+        return summary
+
     def _load_image(
         self, img_path: str, sample_id: str
     ) -> Tuple[np.ndarray, np.ndarray]:
@@ -358,6 +502,7 @@ class SARDataset(Dataset):
            the tensor fully finite for convolution ops, but the accompanying
            ``valid_mask`` ensures these pixels are excluded from the loss.
         """
+        load_started_at = time.perf_counter() if self._profile_quantiles else None
         try:
             with rasterio.open(img_path) as src:
                 if self.expected_img_bands is not None and src.count != self.expected_img_bands:
@@ -383,8 +528,39 @@ class SARDataset(Dataset):
 
         flat = img_t.view(img_t.shape[0], -1)
 
-        lower = torch.nanquantile(flat, 0.02, dim=1, keepdim=True).view(-1, 1, 1)
-        upper = torch.nanquantile(flat, 0.98, dim=1, keepdim=True).view(-1, 1, 1)
+        cache_key = {
+            "version": _QUANTILE_CACHE_VERSION,
+            "dataset_type": "sar",
+            "file": _file_cache_fingerprint(img_path),
+            "clip_low": 0.02,
+            "clip_high": 0.98,
+            "band_selection": None,
+            "expected_img_bands": self.expected_img_bands,
+            "log_transform": self.log_transform,
+        }
+        cache_path = _quantile_cache_path(
+            self.quantile_cache_root, "sar", sample_id, img_path
+        )
+        cached = _load_quantile_cache(cache_path, cache_key)
+        if cached is not None and cached["lower"].numel() == img_t.shape[0]:
+            self._record_cache_hit()
+            lower_1d = cached["lower"].to(dtype=img_t.dtype, device=img_t.device)
+            upper_1d = cached["upper"].to(dtype=img_t.dtype, device=img_t.device)
+        else:
+            self._record_cache_miss()
+            q = torch.tensor([0.02, 0.98], dtype=flat.dtype, device=flat.device)
+            quantile_started_at = time.perf_counter() if self._profile_quantiles else None
+            quantiles = torch.nanquantile(flat, q, dim=1)
+            if quantile_started_at is not None:
+                self._record_nanquantile_time(
+                    flat, time.perf_counter() - quantile_started_at
+                )
+            lower_1d = quantiles[0]
+            upper_1d = quantiles[1]
+            _save_quantile_cache(cache_path, cache_key, lower_1d, upper_1d)
+
+        lower = lower_1d.view(-1, 1, 1)
+        upper = upper_1d.view(-1, 1, 1)
 
         img_t = torch.clamp(img_t, lower, upper)
 
@@ -417,6 +593,7 @@ class SARDataset(Dataset):
                 img[c] = band
 
         img = self._apply_normalization(img)
+        self._record_load_image_time(load_started_at)
         return img, valid_mask
 
     def _load_mask(self, mask_path: str, expected_hw: Tuple[int, int], sample_id: str) -> np.ndarray:
