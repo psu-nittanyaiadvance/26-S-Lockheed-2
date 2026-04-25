@@ -67,6 +67,7 @@ class FusedDataset(Dataset):
         *,
         strict_pairing: bool = False,
         strict_manifest_samples: Optional[Sequence[CombinedManifestSample]] = None,
+        return_mode: str = "fused",
     ) -> None:
         if optical_missing_policy not in {"zeros", "sar_only", "raise"}:
             raise ValueError(
@@ -85,6 +86,12 @@ class FusedDataset(Dataset):
         self.require_spatial_match = require_spatial_match
         self.strict_pairing = bool(strict_pairing)
         self._strict_manifest_samples = list(strict_manifest_samples or [])
+        if return_mode not in {"fused", "paired"}:
+            raise ValueError(
+                "return_mode must be one of {'fused', 'paired'}; "
+                f"got {return_mode!r}"
+            )
+        self.return_mode = return_mode
 
         self._optical_id_to_idx: Dict[str, int] = {}
         for i in range(len(optical_dataset)):  # type: ignore[arg-type]
@@ -128,6 +135,7 @@ class FusedDataset(Dataset):
         optical_dataset_kwargs: Optional[Dict[str, Any]] = None,
         require_spatial_match: bool = True,
         validate: bool = True,
+        return_mode: str = "fused",
     ) -> "FusedDataset":
         """
         Build a strict manifest-backed fused dataset from Combined/manifest.csv.
@@ -171,6 +179,9 @@ class FusedDataset(Dataset):
             validate=False,
             **sar_dataset_kwargs,
         )
+        if mode != "none":
+            for sar_sample, manifest_sample in zip(sar_dataset.samples, samples):
+                sar_sample["mask_path"] = manifest_sample.label_path
         optical_dataset = OpticalDataset(
             img_root=None,
             mask_root=None,
@@ -188,18 +199,25 @@ class FusedDataset(Dataset):
             require_spatial_match=require_spatial_match,
             strict_pairing=True,
             strict_manifest_samples=samples,
+            return_mode=return_mode,
         )
 
     def __len__(self) -> int:
         return len(self.sar_dataset)  # type: ignore[arg-type]
 
-    def __getitem__(
-        self, idx: int
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Dict[str, Any]]:
-        sar_img, mask_tensor, sar_meta = self.sar_dataset[idx]
-        sample_id = str(sar_meta.get("id", idx))
+    def __getitem__(self, idx: int) -> Any:
+        if self.return_mode == "paired":
+            return self._paired_training_item(idx)
 
-        sar_img = sar_img.to(dtype=torch.float32)
+        pair = self._load_pair(idx)
+        sample_id = pair["paired_sample_id"]
+        sar_img = pair["sar_image"].to(dtype=torch.float32)
+        opt_img = pair["optical_image"].to(dtype=torch.float32)
+        mask_tensor = pair["mask"]
+        sar_meta = pair["sar_metadata"]
+        opt_meta = pair["optical_metadata"]
+        optical_available = pair["optical_available"]
+
         sar_hw = (sar_img.shape[-2], sar_img.shape[-1])
         sar_valid = self._coerce_valid_mask(
             sar_meta.get("valid_mask"),
@@ -208,25 +226,7 @@ class FusedDataset(Dataset):
             source="sar",
         )
 
-        opt_idx = self._optical_id_to_idx.get(sample_id)
-        if opt_idx is None:
-            if self.optical_missing_policy == "raise":
-                raise RuntimeError(f"No paired optical tile for SAR id='{sample_id}'")
-
-            h, w = sar_hw
-            opt_img = torch.zeros(self._n_optical_bands, h, w, dtype=torch.float32)
-            opt_valid = sar_valid
-            opt_meta: Dict[str, Any] = {
-                "id": sample_id,
-                "img_path": None,
-                "mask_path": None,
-                "valid_mask": opt_valid,
-                "modality": "optical",
-            }
-            optical_available = False
-        else:
-            opt_img, _opt_mask, opt_meta = self.optical_dataset[opt_idx]
-            opt_img = opt_img.to(dtype=torch.float32)
+        if optical_available:
             opt_hw = (opt_img.shape[-2], opt_img.shape[-1])
             opt_valid = self._coerce_valid_mask(
                 opt_meta.get("valid_mask"),
@@ -242,6 +242,8 @@ class FusedDataset(Dataset):
                     f"SAR {sar_hw} vs optical {opt_hw}. "
                     "Either pre-register tiles or set require_spatial_match=False."
                 )
+        else:
+            opt_valid = sar_valid
 
         fused_img = torch.cat([sar_img, opt_img], dim=0)
         fused_valid = sar_valid & opt_valid if optical_available else sar_valid
@@ -266,8 +268,192 @@ class FusedDataset(Dataset):
             strict_sample = self._strict_manifest_samples[idx]
             metadata["manifest_path"] = strict_sample.manifest_path
             metadata["manifest_row_index"] = strict_sample.manifest_index
+            metadata["label_path"] = strict_sample.label_path
 
         return fused_img, mask_tensor, metadata
+
+    def _paired_training_item(self, idx: int) -> Dict[str, Any]:
+        pair = self._load_pair(idx)
+        sample_id = pair["paired_sample_id"]
+        sar_img = pair["sar_image"].to(dtype=torch.float32)
+        opt_img = pair["optical_image"].to(dtype=torch.float32)
+        sar_meta = pair["sar_metadata"]
+        opt_meta = pair["optical_metadata"]
+        optical_available = pair["optical_available"]
+
+        sar_hw = (sar_img.shape[-2], sar_img.shape[-1])
+        sar_valid = self._coerce_valid_mask(
+            sar_meta.get("valid_mask"),
+            sar_hw,
+            sample_id=sample_id,
+            source="sar",
+        )
+
+        if not optical_available:
+            raise RuntimeError(
+                "paired return_mode requires optical data for every sample; "
+                f"missing optical tile for id='{sample_id}'"
+            )
+
+        opt_hw = (opt_img.shape[-2], opt_img.shape[-1])
+        opt_valid = self._coerce_valid_mask(
+            opt_meta.get("valid_mask"),
+            opt_hw,
+            sample_id=sample_id,
+            source="optical",
+        )
+
+        if self.require_spatial_match and sar_hw != opt_hw:
+            raise ValueError(
+                f"SAR and optical spatial dims differ for id='{sample_id}': "
+                f"SAR {sar_hw} vs optical {opt_hw}. "
+                "Either pre-register tiles or set require_spatial_match=False."
+            )
+
+        metadata: Dict[str, Any] = {
+            "id": sample_id,
+            "paired_sample_id": sample_id,
+            "sar_img_path": sar_meta.get("img_path"),
+            "optical_img_path": opt_meta.get("img_path"),
+            "strict_paired_mode": self.strict_pairing,
+            "pairing_source": (
+                "combined_manifest" if self.strict_pairing else "id_lookup"
+            ),
+            "fused_optical_available": True,
+            "n_sar_bands": sar_img.shape[0],
+            "n_optical_bands": opt_img.shape[0],
+            "modality": "paired_multimodal",
+        }
+        if self.strict_pairing:
+            strict_sample = self._strict_manifest_samples[idx]
+            metadata["manifest_path"] = strict_sample.manifest_path
+            metadata["manifest_row_index"] = strict_sample.manifest_index
+
+        return {
+            "sar": sar_img,
+            "optical": opt_img,
+            "valid_mask": sar_valid & opt_valid,
+            "meta": metadata,
+        }
+
+    def get_paired_item(
+        self,
+        idx: int,
+        *,
+        require_no_transforms: bool = False,
+    ) -> Dict[str, Any]:
+        """
+        Return a strict paired sample with SAR and optical tensors kept separate.
+
+        This uses the current child datasets. For pre-augmentation inspection,
+        construct the dataset with child ``transforms=None`` and pass
+        ``require_no_transforms=True``.
+        """
+        if require_no_transforms:
+            self._assert_no_child_transforms()
+
+        pair = self._load_pair(idx)
+        sample_id = pair["paired_sample_id"]
+        sar_img = pair["sar_image"].to(dtype=torch.float32)
+        opt_img = pair["optical_image"].to(dtype=torch.float32)
+        sar_hw = (sar_img.shape[-2], sar_img.shape[-1])
+        opt_hw = (opt_img.shape[-2], opt_img.shape[-1])
+        sar_valid = self._coerce_valid_mask(
+            pair["sar_metadata"].get("valid_mask"),
+            sar_hw,
+            sample_id=sample_id,
+            source="sar",
+        )
+        opt_valid = self._coerce_valid_mask(
+            pair["optical_metadata"].get("valid_mask"),
+            opt_hw,
+            sample_id=sample_id,
+            source="optical",
+        )
+        sar_meta = dict(pair["sar_metadata"])
+        opt_meta = dict(pair["optical_metadata"])
+        sar_meta["valid_mask"] = sar_valid
+        opt_meta["valid_mask"] = opt_valid
+
+        metadata = dict(sar_meta)
+        metadata.pop("valid_mask", None)
+        metadata["id"] = sample_id
+        metadata["paired_sample_id"] = sample_id
+        metadata["sar_img_path"] = sar_meta.get("img_path")
+        metadata["optical_img_path"] = opt_meta.get("img_path")
+        metadata["label_path"] = None
+        metadata["mask_path"] = sar_meta.get("mask_path")
+        metadata["strict_paired_mode"] = self.strict_pairing
+        metadata["pairing_source"] = (
+            "combined_manifest" if self.strict_pairing else "id_lookup"
+        )
+        metadata["fused_optical_available"] = pair["optical_available"]
+        metadata["n_sar_bands"] = sar_img.shape[0]
+        metadata["n_optical_bands"] = opt_img.shape[0]
+        metadata["sar_valid_mask"] = sar_valid
+        metadata["optical_valid_mask"] = opt_valid
+
+        if self.strict_pairing:
+            strict_sample = self._strict_manifest_samples[idx]
+            metadata["manifest_path"] = strict_sample.manifest_path
+            metadata["manifest_row_index"] = strict_sample.manifest_index
+            metadata["label_path"] = strict_sample.label_path
+
+        return {
+            "paired_sample_id": sample_id,
+            "sar_image": sar_img,
+            "optical_image": opt_img,
+            "mask": pair["mask"],
+            "sar_metadata": sar_meta,
+            "optical_metadata": opt_meta,
+            "metadata": metadata,
+        }
+
+    def _load_pair(self, idx: int) -> Dict[str, Any]:
+        sar_img, mask_tensor, sar_meta = self.sar_dataset[idx]
+        sample_id = str(sar_meta.get("id", idx))
+        sar_hw = (sar_img.shape[-2], sar_img.shape[-1])
+
+        opt_idx = self._optical_id_to_idx.get(sample_id)
+        if opt_idx is None:
+            if self.optical_missing_policy == "raise":
+                raise RuntimeError(f"No paired optical tile for SAR id='{sample_id}'")
+
+            h, w = sar_hw
+            opt_img = torch.zeros(self._n_optical_bands, h, w, dtype=torch.float32)
+            opt_meta: Dict[str, Any] = {
+                "id": sample_id,
+                "img_path": None,
+                "mask_path": None,
+                "valid_mask": sar_meta.get("valid_mask"),
+                "modality": "optical",
+            }
+            optical_available = False
+        else:
+            opt_img, _opt_mask, opt_meta = self.optical_dataset[opt_idx]
+            optical_available = True
+
+        return {
+            "paired_sample_id": sample_id,
+            "sar_image": sar_img,
+            "optical_image": opt_img,
+            "mask": mask_tensor,
+            "sar_metadata": sar_meta,
+            "optical_metadata": opt_meta,
+            "optical_available": optical_available,
+        }
+
+    def _assert_no_child_transforms(self) -> None:
+        enabled = []
+        if getattr(self.sar_dataset, "transforms", None) is not None:
+            enabled.append("sar_dataset.transforms")
+        if getattr(self.optical_dataset, "transforms", None) is not None:
+            enabled.append("optical_dataset.transforms")
+        if enabled:
+            raise ValueError(
+                "Pre-augmentation paired access requires transforms to be disabled; "
+                f"enabled: {enabled}"
+            )
 
     @staticmethod
     def _reject_strict_dataset_overrides(

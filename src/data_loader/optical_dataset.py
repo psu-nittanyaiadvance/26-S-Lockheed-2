@@ -24,6 +24,8 @@ Supported normalisation types (same as SARDataset):
 from __future__ import annotations
 
 import warnings
+import os
+import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -34,10 +36,16 @@ import torch
 from torch.utils.data import Dataset
 
 from .sar_dataset import (   # re-use shared helpers
+    DEFAULT_QUANTILE_CACHE_ROOT,
     NormalizeCfg,
     Sample,
+    _QUANTILE_CACHE_VERSION,
+    _file_cache_fingerprint,
     _infer_ids_are_paths,
     _is_tif_name,
+    _load_quantile_cache,
+    _quantile_cache_path,
+    _save_quantile_cache,
 )
 
 
@@ -111,6 +119,7 @@ class OpticalDataset(Dataset):
         ids_are_paths: Optional[bool] = None,
         mask_id_suffix_map: Optional[Dict[str, str]] = None,
         expected_img_bands: Optional[int] = None,
+        quantile_cache_root: Optional[Union[str, Path]] = DEFAULT_QUANTILE_CACHE_ROOT,
     ) -> None:
         if mode not in {"weak", "strong", "none"}:
             raise ValueError(f"mode must be 'weak', 'strong', or 'none'; got {mode!r}")
@@ -132,6 +141,21 @@ class OpticalDataset(Dataset):
         self.expected_img_bands = expected_img_bands
         if self.expected_img_bands is not None and self.expected_img_bands <= 0:
             raise ValueError("expected_img_bands must be a positive integer")
+        if os.environ.get("LOCKDOCKS_DISABLE_QUANTILE_CACHE") == "1":
+            quantile_cache_root = None
+        self.quantile_cache_root = (
+            Path(quantile_cache_root) if quantile_cache_root is not None else None
+        )
+        self._profile_quantiles = os.environ.get("LOCKDOCKS_PROFILE_QUANTILES") == "1"
+        self._quantile_profile: Dict[str, Any] = {
+            "load_image_calls": 0,
+            "load_image_seconds": 0.0,
+            "nanquantile_calls": 0,
+            "nanquantile_seconds": 0.0,
+            "cache_hits": 0,
+            "cache_misses": 0,
+            "shapes": {},
+        }
 
         if ids_are_paths is None:
             ids_are_paths = _infer_ids_are_paths(ids_or_paths)
@@ -213,6 +237,62 @@ class OpticalDataset(Dataset):
             std = self._norm_std.reshape(c, 1, 1)
             return (img - mean) / std
         raise ValueError(f"Unknown normalization type: {self._normalize_type}")
+
+    def _record_quantile_shape(self, flat: torch.Tensor) -> None:
+        if not self._profile_quantiles:
+            return
+        shapes = self._quantile_profile["shapes"]
+        key = f"{tuple(flat.shape)} {flat.dtype} {flat.device}"
+        shapes[key] = int(shapes.get(key, 0)) + 1
+
+    def _record_nanquantile_time(self, flat: torch.Tensor, seconds: float) -> None:
+        if not self._profile_quantiles:
+            return
+        self._quantile_profile["nanquantile_calls"] += 1
+        self._quantile_profile["nanquantile_seconds"] += seconds
+        self._record_quantile_shape(flat)
+
+    def _record_cache_hit(self) -> None:
+        if self._profile_quantiles:
+            self._quantile_profile["cache_hits"] += 1
+
+    def _record_cache_miss(self) -> None:
+        if self._profile_quantiles:
+            self._quantile_profile["cache_misses"] += 1
+
+    def _record_load_image_time(self, started_at: Optional[float]) -> None:
+        if started_at is None or not self._profile_quantiles:
+            return
+        self._quantile_profile["load_image_calls"] += 1
+        self._quantile_profile["load_image_seconds"] += time.perf_counter() - started_at
+
+    def quantile_profile_summary(self, *, reset: bool = False) -> Dict[str, Any]:
+        """
+        Return lightweight dataloader quantile counters.
+
+        Enable collection with ``LOCKDOCKS_PROFILE_QUANTILES=1``. Call this at
+        epoch boundaries if per-epoch counters are needed.
+        """
+        summary = {
+            "load_image_calls": self._quantile_profile["load_image_calls"],
+            "load_image_seconds": self._quantile_profile["load_image_seconds"],
+            "nanquantile_calls": self._quantile_profile["nanquantile_calls"],
+            "nanquantile_seconds": self._quantile_profile["nanquantile_seconds"],
+            "cache_hits": self._quantile_profile["cache_hits"],
+            "cache_misses": self._quantile_profile["cache_misses"],
+            "shapes": dict(self._quantile_profile["shapes"]),
+        }
+        if reset:
+            self._quantile_profile = {
+                "load_image_calls": 0,
+                "load_image_seconds": 0.0,
+                "nanquantile_calls": 0,
+                "nanquantile_seconds": 0.0,
+                "cache_hits": 0,
+                "cache_misses": 0,
+                "shapes": {},
+            }
+        return summary
 
     # ── path resolution ──────────────────────────────────────────────────────
 
@@ -327,6 +407,7 @@ class OpticalDataset(Dataset):
         valid_mask : np.ndarray, shape (H, W), dtype bool.
             False wherever any band was invalid or cloud-masked.
         """
+        load_started_at = time.perf_counter() if self._profile_quantiles else None
         # ---- 1. Read bands --------------------------------------------------
         try:
             with rasterio.open(img_path) as src:
@@ -364,8 +445,47 @@ class OpticalDataset(Dataset):
 
         # ---- 2. Scale to [0, 1] reflectance ---------------------------------
         # Use the 99th-percentile of finite values to detect DN range.
-        finite_vals = img[np.isfinite(img)]
-        if finite_vals.size > 0 and np.nanpercentile(finite_vals, 99) > _DN_THRESHOLD:
+        cached_quantiles: Optional[Dict[str, Any]] = None
+        cache_key: Optional[Dict[str, Any]] = None
+        cache_path: Optional[Path] = None
+        scaled_by_dn_cache: Optional[bool] = None
+        if self.reflectance_clip_percentile > 0.0:
+            lo_pct = self.reflectance_clip_percentile
+            hi_pct = 100.0 - lo_pct
+            cache_key = {
+                "version": _QUANTILE_CACHE_VERSION,
+                "dataset_type": "optical",
+                "file": _file_cache_fingerprint(img_path),
+                "clip_low": lo_pct / 100.0,
+                "clip_high": hi_pct / 100.0,
+                "band_selection": self.s2_bands,
+                "expected_img_bands": self.expected_img_bands,
+                "log_transform": False,
+                "dn_threshold": _DN_THRESHOLD,
+                "dn_scale": _S2_DN_SCALE,
+            }
+            cache_path = _quantile_cache_path(
+                self.quantile_cache_root, "optical", sample_id, img_path
+            )
+            cached_quantiles = _load_quantile_cache(cache_path, cache_key)
+            if (
+                cached_quantiles is not None
+                and cached_quantiles["lower"].numel() == img.shape[0]
+                and "scaled_by_s2_dn_scale" in cached_quantiles
+            ):
+                scaled_by_dn_cache = bool(cached_quantiles["scaled_by_s2_dn_scale"])
+            else:
+                cached_quantiles = None
+
+        if scaled_by_dn_cache is None:
+            finite_vals = img[np.isfinite(img)]
+            scaled_by_dn = (
+                finite_vals.size > 0
+                and np.nanpercentile(finite_vals, 99) > _DN_THRESHOLD
+            )
+        else:
+            scaled_by_dn = scaled_by_dn_cache
+        if scaled_by_dn:
             img = img / _S2_DN_SCALE
 
         # ---- 3. Flag invalid pixels -----------------------------------------
@@ -386,8 +506,39 @@ class OpticalDataset(Dataset):
             hi_pct = 100.0 - lo_pct
             img_t = torch.from_numpy(img)
             flat = img_t.view(img_t.shape[0], -1)
-            lo = torch.nanquantile(flat, lo_pct / 100.0, dim=1).view(-1, 1, 1)
-            hi = torch.nanquantile(flat, hi_pct / 100.0, dim=1).view(-1, 1, 1)
+            if cached_quantiles is not None:
+                self._record_cache_hit()
+                lo_1d = cached_quantiles["lower"].to(
+                    dtype=img_t.dtype, device=img_t.device
+                )
+                hi_1d = cached_quantiles["upper"].to(
+                    dtype=img_t.dtype, device=img_t.device
+                )
+            else:
+                self._record_cache_miss()
+                q = torch.tensor(
+                    [lo_pct / 100.0, hi_pct / 100.0],
+                    dtype=flat.dtype,
+                    device=flat.device,
+                )
+                quantile_started_at = time.perf_counter() if self._profile_quantiles else None
+                quantiles = torch.nanquantile(flat, q, dim=1)
+                if quantile_started_at is not None:
+                    self._record_nanquantile_time(
+                        flat, time.perf_counter() - quantile_started_at
+                    )
+                lo_1d = quantiles[0]
+                hi_1d = quantiles[1]
+                if cache_key is not None:
+                    _save_quantile_cache(
+                        cache_path,
+                        cache_key,
+                        lo_1d,
+                        hi_1d,
+                        extra={"scaled_by_s2_dn_scale": bool(scaled_by_dn)},
+                    )
+            lo = lo_1d.view(-1, 1, 1)
+            hi = hi_1d.view(-1, 1, 1)
             img_t = torch.clamp(img_t, lo, hi)
             img = img_t.numpy()
 
@@ -427,6 +578,7 @@ class OpticalDataset(Dataset):
                 img[c] = band
 
         img = self._apply_normalization(img)
+        self._record_load_image_time(load_started_at)
         return img, valid_mask
 
     def _load_mask(

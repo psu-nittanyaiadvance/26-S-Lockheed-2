@@ -60,3 +60,126 @@ def default_collate(
     valid_masks = torch.stack(valid_mask_list, dim=0)  # [B, H, W], bool
 
     return images, mask_batch, valid_masks, metas
+
+
+def multimodal_pretrain_collate(
+    batch: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    """
+    Collate strict paired multimodal pretraining samples into a dict batch.
+
+    Expected per-sample keys:
+    - ``sar``: float tensor [C_sar, H, W]
+    - ``optical``: float tensor [C_opt, H, W]
+    - ``valid_mask``: bool-like tensor [H, W] or [1, H, W]
+    - ``meta``: metadata dict with no label-bearing fields
+    """
+    if not batch:
+        raise ValueError("Empty batch")
+
+    sar_items: List[torch.Tensor] = []
+    optical_items: List[torch.Tensor] = []
+    valid_masks: List[torch.Tensor] = []
+    metas: List[Dict[str, Any]] = []
+
+    expected_sar_shape: Optional[Tuple[int, int, int]] = None
+    expected_optical_shape: Optional[Tuple[int, int, int]] = None
+
+    for idx, sample in enumerate(batch):
+        if not isinstance(sample, dict):
+            raise TypeError(
+                "multimodal_pretrain_collate expects dict samples; "
+                f"got {type(sample)!r} at batch index {idx}"
+            )
+
+        required = {"sar", "optical", "valid_mask", "meta"}
+        missing = sorted(name for name in required if name not in sample)
+        if missing:
+            raise KeyError(
+                f"Missing required keys {missing} in multimodal sample at batch index {idx}"
+            )
+
+        sar = sample["sar"]
+        optical = sample["optical"]
+        valid_mask = sample["valid_mask"]
+        meta = sample["meta"]
+
+        if not isinstance(meta, dict):
+            raise TypeError(
+                f"Sample metadata must be a dict, got {type(meta)!r} at batch index {idx}"
+            )
+        forbidden_meta = {"mask_path", "label_path"}
+        present_forbidden = sorted(name for name in forbidden_meta if name in meta)
+        if present_forbidden:
+            raise ValueError(
+                "Multimodal pretraining batches must not carry label-bearing metadata; "
+                f"found {present_forbidden} at batch index {idx}"
+            )
+
+        if not isinstance(sar, torch.Tensor):
+            sar = torch.as_tensor(sar)
+        if not isinstance(optical, torch.Tensor):
+            optical = torch.as_tensor(optical)
+        if not isinstance(valid_mask, torch.Tensor):
+            valid_mask = torch.as_tensor(valid_mask)
+
+        if sar.ndim != 3:
+            raise ValueError(
+                f"SAR sample must have shape [C,H,W], got {tuple(sar.shape)} at batch index {idx}"
+            )
+        if optical.ndim != 3:
+            raise ValueError(
+                "Optical sample must have shape [C,H,W], "
+                f"got {tuple(optical.shape)} at batch index {idx}"
+            )
+        if tuple(sar.shape[-2:]) != tuple(optical.shape[-2:]):
+            raise ValueError(
+                "SAR and optical spatial dims must match within each sample; "
+                f"got SAR {tuple(sar.shape)} and optical {tuple(optical.shape)} "
+                f"at batch index {idx}"
+            )
+
+        if valid_mask.ndim == 2:
+            valid_mask = valid_mask.unsqueeze(0)
+        elif valid_mask.ndim == 3 and valid_mask.shape[0] == 1:
+            pass
+        else:
+            raise ValueError(
+                "valid_mask must have shape [H,W] or [1,H,W], "
+                f"got {tuple(valid_mask.shape)} at batch index {idx}"
+            )
+        if tuple(valid_mask.shape[-2:]) != tuple(sar.shape[-2:]):
+            raise ValueError(
+                "valid_mask spatial dims must match SAR/optical dims; "
+                f"got valid_mask {tuple(valid_mask.shape)} and image {tuple(sar.shape)} "
+                f"at batch index {idx}"
+            )
+
+        if expected_sar_shape is None:
+            expected_sar_shape = tuple(sar.shape)
+            expected_optical_shape = tuple(optical.shape)
+        else:
+            if tuple(sar.shape) != expected_sar_shape:
+                raise ValueError(
+                    "All SAR tensors in a batch must share the same shape; "
+                    f"expected {expected_sar_shape}, got {tuple(sar.shape)} "
+                    f"at batch index {idx}"
+                )
+            if tuple(optical.shape) != expected_optical_shape:
+                raise ValueError(
+                    "All optical tensors in a batch must share the same shape; "
+                    f"expected {expected_optical_shape}, got {tuple(optical.shape)} "
+                    f"at batch index {idx}"
+                )
+
+        sar_items.append(sar.to(dtype=torch.float32))
+        optical_items.append(optical.to(dtype=torch.float32))
+        valid_masks.append(valid_mask.to(dtype=torch.bool))
+        metas.append(dict(meta))
+
+    return {
+        "sar": torch.stack(sar_items, dim=0),
+        "optical": torch.stack(optical_items, dim=0),
+        "valid_mask": torch.stack(valid_masks, dim=0),
+        "meta": metas,
+    }

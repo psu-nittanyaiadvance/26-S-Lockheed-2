@@ -14,20 +14,20 @@ from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 from tqdm import tqdm
 
-from binary_mode import (
+from .binary_mode import (
     ACTIVE_BINARY_METRIC_THRESHOLD,
     compute_binary_confusion,
     prepare_binary_target,
     prepare_binary_valid_mask,
     require_active_binary_mode,
 )
-from eval import evaluate
-from UNet.UNetModel import UNet as UNetModel
+from .eval import evaluate
+from models.UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
 
 DEFAULT_MASK_ID_SUFFIX_MAP = {
-    "S1Hand": "S1OtsuLabelHand",
+    "S1Hand": "LabelHand",
     "S1Weak": "S1OtsuLabelWeak",
 }
 

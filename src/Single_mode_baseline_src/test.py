@@ -1,19 +1,21 @@
 import argparse
 import logging
 import torch
+import numpy as np
+from PIL import Image
 import torch.nn.functional as F
 from pathlib import Path
 from torch.utils.data import DataLoader, random_split
 from torch.utils.tensorboard import SummaryWriter
 
 # Imports from your repository structure
-from binary_mode import ACTIVE_BINARY_METRIC_THRESHOLD, prepare_binary_target, prepare_binary_valid_mask, require_active_binary_mode
-from eval import evaluate
-from UNet.UNetModel import UNet as UNetModel
+from .binary_mode import ACTIVE_BINARY_METRIC_THRESHOLD, prepare_binary_target, prepare_binary_valid_mask, require_active_binary_mode
+from .eval import evaluate
+from models.UNet.UNetModel import UNet as UNetModel
 from data_loader import PatchDataset, SARDataset, list_ids_from_dir, validate_sample_shapes
 
 # We need the same collate function and map used in training
-from train import active_dict_collate, resolve_mask_id, DEFAULT_MASK_ID_SUFFIX_MAP, focal_tversky_loss
+from .train import active_dict_collate, resolve_mask_id, DEFAULT_MASK_ID_SUFFIX_MAP, focal_tversky_loss
 
 
 def calculate_mask_iou(pred, target, valid_mask=None):
@@ -175,16 +177,33 @@ if __name__ == '__main__':
             
             # Iterate through the batch
             for i in range(images.shape[0]):
-                # Move to CPU for logging/calculations
+                # Inside the `for i in range(images.shape[0]):` loop, after current_iou is computed
                 pred_mask = pred_binary[i].cpu()
                 true_mask = batch['mask'][i].float().cpu()
-                
+
                 # Pull the specific valid mask for this image if it exists
                 vm = raw_valid_masks[i].cpu() if raw_valid_masks is not None else None
 
                 # Calculate individual mask IoU
                 current_iou = calculate_mask_iou(pred_mask, true_mask, valid_mask=vm)
                 
+                sar_np = images[i][0].cpu().numpy()
+
+                if global_step == 0:
+                    print(f"SAR stats — min: {sar_np.min():.4f}, max: {sar_np.max():.4f}, "
+                        f"mean: {sar_np.mean():.4f}, std: {sar_np.std():.4f}")
+
+                DISPLAY_MIN, DISPLAY_MAX = -20.0, -2.0
+                sar_clipped = np.clip(sar_np, DISPLAY_MIN, DISPLAY_MAX)
+                sar_norm = ((sar_clipped - DISPLAY_MIN) / (DISPLAY_MAX - DISPLAY_MIN) * 255).astype(np.uint8)
+                Image.fromarray(sar_norm).save(out_dir / f'{global_step:05d}_sar.png')
+
+                gt_np = (true_mask.squeeze().numpy() * 255).astype(np.uint8)
+                Image.fromarray(gt_np).save(out_dir / f'{global_step:05d}_gt.png')
+
+                pred_np = (pred_mask.squeeze().numpy() * 255).astype(np.uint8)
+                Image.fromarray(pred_np).save(out_dir / f'{global_step:05d}_pred.png')
+
                 # Log Images. Note: images[i][0:1] safely extracts just the first channel (e.g., VV or VH) 
                 # to render as grayscale in Tensorboard, avoiding 2-channel errors.
                 writer.add_image('Test_Visuals/1_SAR_Image', images[i][0:1].cpu(), global_step)
